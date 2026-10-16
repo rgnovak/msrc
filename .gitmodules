@@ -1,3 +1,6 @@
 [submodule "board/freertos/FreeRTOS-Kernel"]
 	path = board/freertos/FreeRTOS-Kernel
-	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
+	# RP2350-Support (RP2350_ARM_NTZ-Port) gibt es nur im RPi-eigenen Fork,
+	# nicht im FreeRTOS-Upstream. Der RP2040/ARM_CM0-Port ist darin
+	# weiterhin enthalten, der bestehende RP2040-Build bleibt unverändert.
+	url = https://github.com/raspberrypi/FreeRTOS-Kernel.git

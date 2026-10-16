@@ -1,10 +1,15 @@
 #ifndef FREERTOS_CONFIG_H
 #define FREERTOS_CONFIG_H
 
-/* Use Pico SDK ISR handlers */
+/* Use Pico SDK ISR handlers (nur RP2040/Cortex-M0: der RP2350-Port
+   (Cortex-M33) definiert SVC_Handler/PendSV_Handler/SysTick_Handler
+   bereits direkt - das deckt sich schon mit dem, was die SDK-eigene
+   CMSIS-Umbenennung fuer M33 erwartet, keine Umleitung noetig) */
+#if PICO_RP2040
 #define vPortSVCHandler         isr_svcall
 #define xPortPendSVHandler      isr_pendsv
 #define xPortSysTickHandler     isr_systick
+#endif
 
 #define configUSE_PREEMPTION                    1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION 0
@@ -80,5 +85,15 @@
 #define INCLUDE_xTaskResumeFromISR              1
 
 /* A header file that defines trace macro can be included here. */
+
+/* Pflichtoptionen fuer den Armv8-M-Port (RP2350, Cortex-M33), siehe
+   portable/ThirdParty/GCC/RP2350_ARM_NTZ/README.md im FreeRTOS-Kernel */
+#if PICO_RP2350 && !PICO_RISCV
+#define configENABLE_MPU                        0
+#define configENABLE_TRUSTZONE                  0
+#define configRUN_FREERTOS_SECURE_ONLY          1
+#define configENABLE_FPU                        1
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY    16
+#endif
 
 #endif /* FREERTOS_CONFIG_H */
