@@ -79,7 +79,6 @@
 #define INCLUDE_xTaskGetIdleTaskHandle          0
 #define INCLUDE_eTaskGetState                   0
 #define INCLUDE_xEventGroupSetBitFromISR        1
-#define INCLUDE_xTimerPendFunctionCall          0
 #define INCLUDE_xTaskAbortDelay                 0
 #define INCLUDE_xTaskGetHandle                  0
 #define INCLUDE_xTaskResumeFromISR              1
@@ -94,6 +93,7 @@
 #define configRUN_FREERTOS_SECURE_ONLY          1
 #define configENABLE_FPU                        1
 #define configMAX_SYSCALL_INTERRUPT_PRIORITY    16
+#define INCLUDE_xTimerPendFunctionCall          1
 #endif
 
 #endif /* FREERTOS_CONFIG_H */
