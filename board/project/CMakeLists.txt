@@ -1,10 +1,11 @@
-include_directories(. pio protocol sensor)
+include_directories(. pio protocol sensor cockpit)
 
 add_executable(${PROJECT_NAME})
 
 add_subdirectory(protocol)
 add_subdirectory(sensor)
 add_subdirectory(pio)
+add_subdirectory(cockpit)
 
 target_sources(${PROJECT_NAME} PRIVATE
     main.c
@@ -31,6 +32,7 @@ target_link_libraries(${PROJECT_NAME}
     hardware_pio
     hardware_i2c
     hardware_flash
+    hardware_spi
     pico_i2c_slave
 )
 
