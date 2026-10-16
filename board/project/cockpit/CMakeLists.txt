@@ -3,4 +3,5 @@ target_sources(${PROJECT_NAME} PRIVATE
     pfd.c
     map.c
     bootscreen.c
+    cockpit_task.c
 )
