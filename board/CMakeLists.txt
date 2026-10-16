@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.17.0)
 
 include(pico_sdk_import.cmake)
 
-project(MSRC-RP2040)
+project(MSRC-Core2350B)
 
 include_directories(../include)
 
