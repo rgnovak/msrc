@@ -1,4 +1,5 @@
 #include "srxl2.h"
+#include "srxl2_channels.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -155,9 +156,13 @@ static void process(void) {
                                  SRXL2_DEVICE_INFO, SRXL2_DEVICE_UID);
 
         }
-        // Send telemetry
-        else if (data[0] == SRXL2_HEADER && data[1] == SRXL2_PACKET_TYPE_CONTROL && data[4] == sensor_id_) {
-            send_packet();
+        // Channel data (valid on every Control frame, independent of whose
+        // turn it is to answer with telemetry) + send telemetry on our turn
+        else if (data[0] == SRXL2_HEADER && data[1] == SRXL2_PACKET_TYPE_CONTROL) {
+            srxl2_channels_parse(data, length);
+            if (data[4] == sensor_id_) {
+                send_packet();
+            }
         }
         // Set baudrate
         else if (data[0] == SRXL2_HEADER && data[1] == SRXL2_PACKET_TYPE_HANDSHAKE && data[4] == 0xFF) {

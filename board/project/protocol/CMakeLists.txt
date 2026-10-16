@@ -9,6 +9,7 @@ target_sources(${PROJECT_NAME} PRIVATE
     srxl.c
     xbus.c
     srxl2.c
+    srxl2_channels.c
     crsf.c
     hott.c
     sanwa.c
