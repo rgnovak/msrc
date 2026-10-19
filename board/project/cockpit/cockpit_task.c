@@ -1,10 +1,9 @@
 #include "cockpit_task.h"
 
-#include <math.h>
-
 #include "bootscreen.h"
-#include "compat.h"
+#include "common.h"
 #include "display.h"
+#include "imu.h"
 #include "map.h"
 #include "pfd.h"
 #include "piloten.h"
@@ -12,17 +11,18 @@
 /* Owns both panels end to end: brings up the SPI driver and
  * framebuffers, shows the boot splash once, then renders the PFD
  * (CS1) and the moving map (CS2) in a loop, while also driving the
- * pilot head's gaze servo.
+ * pilot head's gaze servo from real IMU attitude data.
  *
- * Nothing here reads real sensor or SRXL2 data yet - pitch/roll/
- * heading are a gentle synthetic sweep, purely so the panels
- * visibly come alive once this is flashed, standing in for the IMU
- * work that comes next (the servo gaze module itself is already the
- * real port, just fed a synthetic roll for now). Airspeed/altitude/
- * VSI reuse the same fixed demo values the original Arduino sketch
- * used, and ownLat/ownLon (in map.c) never change yet either, so the
- * map's breadcrumb track stays put - also matching the original
- * demo. */
+ * Pitch/roll/heading now come from the ICM-20948 IMU (see imu.c) -
+ * no more synthetic sweep. If the sensor isn't found at startup
+ * (not wired up yet, or a bad connection), imuBegin() logs it and
+ * the loop keeps running with pitch/roll/heading simply at 0 rather
+ * than crashing, so the rest of the panel - map, airspeed/altitude/
+ * VSI, pilot head - still comes up. Airspeed/altitude/VSI still
+ * reuse the same fixed demo values the original Arduino sketch
+ * used (no ESC/airspeed sensor port yet), and ownLat/ownLon (in
+ * map.c) never change yet either, so the map's breadcrumb track
+ * stays put - also matching the original demo. */
 
 void cockpit_task(void *parameters) {
     (void)parameters;
@@ -30,18 +30,20 @@ void cockpit_task(void *parameters) {
     cockpitDisplayBegin();
     pilotenBegin(COCKPIT_PIN_PILOT_SERVO);
 
+    if (!imuBegin(COCKPIT_PIN_IMU_SDA, COCKPIT_PIN_IMU_SCL)) {
+        debug("\ncockpit_task: IMU nicht gefunden - Pitch/Roll/Heading bleiben auf 0");
+    }
+
     showGarminBootscreen();
     cockpitDisplayPushBootscreen();
     vTaskDelay(pdMS_TO_TICKS(4000));
 
-    float heading = 0.0f;
-
     while (1) {
-        heading += 1.0f;
-        if (heading >= 360.0f) heading -= 360.0f;
+        imuUpdate();
 
-        float pitch = 15.0f * sinf(heading * DEG_TO_RAD);
-        float roll = 25.0f * sinf(2.0f * heading * DEG_TO_RAD);
+        float pitch = imuGetPitch();
+        float roll = imuGetRoll();
+        int ihdg = imuGetHeading();
 
         pilotenSetRoll(roll);
         pilotenUpdate(); /* 1. update, before rendering - matches the
@@ -49,7 +51,6 @@ void cockpit_task(void *parameters) {
                            * once more after each panel push" pattern,
                            * trimmed from 4 panels to this board's 2. */
 
-        int ihdg = (int)heading;
         int bug = (ihdg + 45) % 360;
         int course = (ihdg + 30) % 360;
         int bearing = (ihdg + 90) % 360;
