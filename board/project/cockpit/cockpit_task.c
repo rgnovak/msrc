@@ -1,44 +1,127 @@
 #include "cockpit_task.h"
 
 #include "bootscreen.h"
+#include "cockpit_channels.h"
+#include "cockpit_switch.h"
 #include "common.h"
+#include "compat.h"
 #include "display.h"
 #include "imu.h"
 #include "map.h"
 #include "pfd.h"
+#include "pico/time.h"
 #include "piloten.h"
+#include "srxl2_channels.h"
 
-/* Owns both panels end to end: brings up the SPI driver and
- * framebuffers, shows the boot splash once, then renders the PFD
- * (CS1) and the moving map (CS2) in a loop, while also driving the
- * pilot head's gaze servo from real IMU attitude data.
+/* Owns both panels end to end, plus the pilot head's gaze servo and
+ * the 3-position switch that used to come in over a dedicated PWM
+ * wire (pwm_input.cpp in the original Arduino sketch) and now comes
+ * from an SRXL2 channel instead (cockpit_switch.c), decoded by MSRC
+ * itself. Toggle behavior (not level-based - only the act of
+ * switching zones triggers anything) ported 1:1 from the original:
+ *   - switch to HIGH zone: toggle the pilot head's movement on/off
+ *   - switch to LOW zone:  toggle both displays (backlight) on/off
+ *   - CENTER itself does nothing, it's just a pass-through position
+ * Displays and head movement both start OFF at boot - nothing lights
+ * up or moves until the switch is actually worked once - and the
+ * Garmin bootscreen is shown exactly once, the first time the
+ * displays get turned on, never again after that. If the SRXL2 link
+ * drops (no recent frames, or this channel never seen), that's
+ * treated as a safety fallback: displays and head movement both
+ * forced on, same as pwm_input's old "no PWM signal" fallback.
  *
- * Pitch/roll/heading now come from the ICM-20948 IMU (see imu.c) -
- * no more synthetic sweep. If the sensor isn't found at startup
- * (not wired up yet, or a bad connection), imuBegin() logs it and
- * the loop keeps running with pitch/roll/heading simply at 0 rather
- * than crashing, so the rest of the panel - map, airspeed/altitude/
- * VSI, pilot head - still comes up. Airspeed/altitude/VSI still
- * reuse the same fixed demo values the original Arduino sketch
- * used (no ESC/airspeed sensor port yet), and ownLat/ownLon (in
- * map.c) never change yet either, so the map's breadcrumb track
- * stays put - also matching the original demo. */
+ * Pitch/roll/heading come from the ICM-20948 IMU (see imu.c). If the
+ * sensor isn't found at startup, imuBegin() logs it and the loop
+ * keeps running with pitch/roll/heading at 0 rather than crashing.
+ * The pilot head additionally gets a rudder-channel bias (see
+ * piloten.h's pilotenSetRudder()) on top of the existing roll bias.
+ * Airspeed/altitude/VSI still reuse the same fixed demo values the
+ * original Arduino sketch used (no ESC/airspeed sensor port yet),
+ * and ownLat/ownLon (in map.c) never change yet either, so the map's
+ * breadcrumb track stays put - also matching the original demo. */
+
+static float cockpitReadRudderNorm(void) {
+    srxl2_channels_t ch;
+    srxl2_channels_get(&ch);
+
+    if (!(ch.mask & (1u << (COCKPIT_CH_RUDDER - 1)))) return 0.0f;
+
+    float us = srxl2_channel_to_us(ch.raw[COCKPIT_CH_RUDDER - 1]);
+    float norm = (us - 1500.0f) / 500.0f; /* ~988..2012us -> roughly -1..+1 */
+    return constrain(norm, -1.0f, 1.0f);
+}
 
 void cockpit_task(void *parameters) {
     (void)parameters;
 
     cockpitDisplayBegin();
+    cockpitDisplaySetBacklight(false); /* dark until the switch turns it on */
+
     pilotenBegin(COCKPIT_PIN_PILOT_SERVO);
+    pilotenSetEnabled(false); /* head movement also off at boot */
 
     if (!imuBegin(COCKPIT_PIN_IMU_SDA, COCKPIT_PIN_IMU_SCL)) {
         debug("\ncockpit_task: IMU nicht gefunden - Pitch/Roll/Heading bleiben auf 0");
     }
 
-    showGarminBootscreen();
-    cockpitDisplayPushBootscreen();
-    vTaskDelay(pdMS_TO_TICKS(4000));
+    bool displayEnabled = false;
+    bool backlightIsOn = false;
+    bool bootscreenShown = false;
+    bool showingBootscreen = false;
+    uint32_t bootscreenUntilMs = 0;
+
+    /* Prime the zone memory with the switch's actual boot position so
+     * that position itself never counts as a toggle - only a later,
+     * real switch movement does. */
+    cockpitSwitchUpdate();
+    cockpit_switch_zone_t lastZone = cockpitSwitchGetZone();
 
     while (1) {
+        bool displayEnabledBefore = displayEnabled;
+
+        /* ===== SWITCH (TOGGLE, not level-based) ===== */
+        cockpitSwitchUpdate();
+        cockpit_switch_zone_t zone = cockpitSwitchGetZone();
+
+        if (!cockpitSwitchSignalPresent()) {
+            displayEnabled = true;
+            pilotenSetEnabled(true);
+            lastZone = COCKPIT_SWITCH_CENTER;
+        } else if (zone != lastZone) {
+            if (zone == COCKPIT_SWITCH_HIGH) {
+                pilotenSetEnabled(!pilotenGetEnabled());
+            } else if (zone == COCKPIT_SWITCH_LOW) {
+                displayEnabled = !displayEnabled;
+            }
+            lastZone = zone;
+        }
+
+        /* ===== FIRST TIME THE DISPLAYS COME ON -> BOOTSCREEN ONCE ===== */
+        if (displayEnabled && !displayEnabledBefore && !bootscreenShown) {
+            showGarminBootscreen();
+            cockpitDisplayPushBootscreen();
+            cockpitDisplaySetBacklight(true);
+            backlightIsOn = true;
+            bootscreenShown = true;
+            showingBootscreen = true;
+            bootscreenUntilMs = to_ms_since_boot(get_absolute_time()) + 4000;
+        }
+
+        if (showingBootscreen && !displayEnabled) {
+            showingBootscreen = false;
+        }
+
+        /* Backlight follows displayEnabled (only touch the GPIOs on
+         * an actual change). */
+        if (displayEnabled && !backlightIsOn) {
+            cockpitDisplaySetBacklight(true);
+            backlightIsOn = true;
+        } else if (!displayEnabled && backlightIsOn) {
+            cockpitDisplaySetBacklight(false);
+            backlightIsOn = false;
+        }
+
+        /* ===== IMU / PILOT HEAD (always updated, even displays off) ===== */
         imuUpdate();
 
         float pitch = imuGetPitch();
@@ -46,10 +129,25 @@ void cockpit_task(void *parameters) {
         int ihdg = imuGetHeading();
 
         pilotenSetRoll(roll);
+        pilotenSetRudder(cockpitReadRudderNorm());
         pilotenUpdate(); /* 1. update, before rendering - matches the
                            * original Arduino loop's "update once, then
                            * once more after each panel push" pattern,
                            * trimmed from 4 panels to this board's 2. */
+
+        if (!displayEnabled) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        if (showingBootscreen) {
+            if (to_ms_since_boot(get_absolute_time()) >= bootscreenUntilMs) {
+                showingBootscreen = false;
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+        }
 
         int bug = (ihdg + 45) % 360;
         int course = (ihdg + 30) % 360;

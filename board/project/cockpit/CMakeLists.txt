@@ -4,6 +4,7 @@ target_sources(${PROJECT_NAME} PRIVATE
     map.c
     bootscreen.c
     cockpit_task.c
+    cockpit_switch.c
     piloten.c
     imu.c
     icm20948/ICM_20948_C.c

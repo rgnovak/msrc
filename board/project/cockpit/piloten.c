@@ -94,6 +94,22 @@ static float pilotRollDeg = 0.0f;
 void pilotenSetRoll(float rollDeg) { pilotRollDeg = constrain(rollDeg, -45.0f, 45.0f); }
 
 /* ==========================================================
+ * RUDDER-INPUT (vom SRXL2-Kanal, ueber den Cockpit-Task)
+ * ========================================================== */
+static float pilotRudderNorm = 0.0f;
+
+void pilotenSetRudder(float rudderNorm) { pilotRudderNorm = constrain(rudderNorm, -1.0f, 1.0f); }
+
+/* ==========================================================
+ * ENABLE / DISABLE
+ * ========================================================== */
+static bool headEnabled = true;
+static bool parking = false; /* unterwegs zur reinen Neutralstellung (siehe pilotenUpdate) */
+
+void pilotenSetEnabled(bool enabled) { headEnabled = enabled; }
+bool pilotenGetEnabled(void) { return headEnabled; }
+
+/* ==========================================================
  * ZUFALLSZAHLEN (ersetzt Arduinos random())
  * ========================================================== */
 static bool rndSeeded = false;
@@ -120,6 +136,16 @@ static float ease(float t) {
 static int rollBias(void) {
     const float MAX_BIAS = 12.0f;  // max. Servo-Grad durch Roll
     return (int)(pilotRollDeg / 45.0f * MAX_BIAS);
+}
+
+/* Ruder/Gier -> Blick-Bias (zusaetzlich zur Roll-Bias). Vorzeichen
+ * ist eine Annahme (rechtes Ruder -> Blick nach rechts, wie bei der
+ * Roll-Bias) - ohne Board/Sender zum Testen nicht verifizierbar.
+ * Falls es am echten Modell seitenverkehrt ist: Vorzeichen hier
+ * einfach umdrehen. */
+static int rudderBias(void) {
+    const float MAX_BIAS = 10.0f;  // max. Servo-Grad durch Ruder
+    return (int)(pilotRudderNorm * MAX_BIAS);
 }
 
 /* ==========================================================
@@ -187,7 +213,7 @@ static void updateMovement(ServoController *sc) {
 static int neutral = 90;
 
 static void updateNeutral(int *n) {
-    int base = 90 + rollBias();
+    int base = 90 + rollBias() + rudderBias();
     *n = constrain(base + rnd_range(-5, 6), SERVO_MIN + 10, SERVO_MAX - 10);
 }
 
@@ -244,6 +270,24 @@ void pilotenUpdate(void) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
 
     updateMovement(&SC);
+
+    if (!headEnabled) {
+        /* Abgeschaltet: einmalig auf reine Neutralstellung (90 Grad,
+         * ohne Roll-/Ruder-Bias) fahren und dort halten. Laufende
+         * Blicksequenz/FSM wird eingefroren, nicht fortgesetzt. */
+        if (!parking) {
+            seqRunning = false;
+            moveTo(&SC, 90);
+            parking = true;
+        }
+        return;
+    }
+
+    if (parking) {
+        /* Gerade wieder aktiviert: FSM ab jetzt frisch starten. */
+        parking = false;
+        nextAction = now + rnd_range(PAUSE_MIN, PAUSE_MAX);
+    }
 
     if (!seqRunning && now >= nextAction) {
         nextAction = now + rnd_range(PAUSE_MIN, PAUSE_MAX);
