@@ -28,7 +28,9 @@
  * at the same time without any pin collision. GPIO47 is the onboard
  * PSRAM chip-select (WAVESHARE_CORE2350B_PSRAM_CS_PIN) - leave it
  * alone too. GPIO44-46 are free and reserved for the future
- * Cockpit-Audio (ESP32->RP2350) pins.
+ * Cockpit-Audio (ESP32->RP2350) pins; GPIO17-21 are free and reserved
+ * for a future 4-display + second pilot-head servo variant (see
+ * below) - same idea as the Viper-Cockpit build this was inspired by.
  *
  * One pre-existing MSRC-core quirk this board switch exposes, not
  * fixed here: board/project/sensor/{voltage,current,ntc,airspeed}.c
@@ -53,6 +55,21 @@
 
 /* ---- Pilot-head gaze servo ---- */
 #define COCKPIT_PIN_PILOT_SERVO 43
+
+/* ---- Reserved: future 4-display variant + second pilot servo ----
+ * Not wired into any code yet - display.c only drives two panels
+ * (cockpitDisplaySwapAndPush() takes a CS pin, same SPI0/DC/RST as
+ * CS1/CS2 above) and piloten.c only has one servo controller. These
+ * are reserved now so a later 4-panel build (like the old Viper-
+ * Cockpit, which had two pilot-head servos) has its pins already
+ * picked and conflict-free, instead of re-doing this exercise then.
+ * CS3/CS4/BL3/BL4 would share the existing SPI0/DC/RST pins above,
+ * same as CS1/CS2 and BL1/BL2 already do. */
+#define COCKPIT_PIN_CS3 17            // Display 3 (reserved)
+#define COCKPIT_PIN_CS4 18            // Display 4 (reserved)
+#define COCKPIT_PIN_BL3 19            // Display 3 backlight (reserved)
+#define COCKPIT_PIN_BL4 20            // Display 4 backlight (reserved)
+#define COCKPIT_PIN_PILOT_SERVO2 21   // Second pilot-head servo (reserved)
 
 /* ---- Timing ---- */
 /* How long the one-time Garmin bootscreen stays up (ms) after the
