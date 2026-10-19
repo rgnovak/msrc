@@ -1,0 +1,220 @@
+From 8407c3befa78974a9b1d4fc7aaf217e40af7b939 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 16:28:31 +0200
+Subject: [PATCH] Decode SRXL2 Control/ChannelData packets into a shared
+ channel array
+
+srxl2.c only ever inspected Control (0xCD) packets closely enough to
+know whose turn it was to answer with telemetry - the actual channel
+values were received but never parsed, since MSRC's own job (sending
+sensor telemetry back over the bus) never needed them.
+
+Add srxl2_channels.{c,h}: a small, mutex-protected decoder for the
+ChannelData/FailsafeChannelData payload (command 0x00/0x01), giving any
+other task in this firmware image read access to live channel values
+(e.g. switch position, rudder deflection) via srxl2_channels_get(),
+without that task ever touching the SRXL2 UART itself.
+
+Byte layout verified against the public SRXL2 spec and cross-checked
+against Betaflight's rx/srxl2.c + rx/srxl2_types.h (an independent,
+flight-tested implementation).
+
+Hooked in from srxl2.c's process(): channel data is now parsed on
+every Control frame regardless of replyId, since channel data is valid
+every frame - only the existing send_packet() call stays gated on
+data[4] == sensor_id_ (our telemetry turn).
+---
+ board/project/protocol/CMakeLists.txt   |  1 +
+ board/project/protocol/srxl2.c          | 11 ++--
+ board/project/protocol/srxl2_channels.c | 65 ++++++++++++++++++++++++
+ board/project/protocol/srxl2_channels.h | 67 +++++++++++++++++++++++++
+ 4 files changed, 141 insertions(+), 3 deletions(-)
+ create mode 100644 board/project/protocol/srxl2_channels.c
+ create mode 100644 board/project/protocol/srxl2_channels.h
+
+diff --git a/board/project/protocol/CMakeLists.txt b/board/project/protocol/CMakeLists.txt
+index 4223c79..62e11d1 100644
+--- a/board/project/protocol/CMakeLists.txt
++++ b/board/project/protocol/CMakeLists.txt
+@@ -9,6 +9,7 @@ target_sources(${PROJECT_NAME} PRIVATE
+     srxl.c
+     xbus.c
+     srxl2.c
++    srxl2_channels.c
+     crsf.c
+     hott.c
+     sanwa.c
+diff --git a/board/project/protocol/srxl2.c b/board/project/protocol/srxl2.c
+index 10d4bc7..85b3471 100644
+--- a/board/project/protocol/srxl2.c
++++ b/board/project/protocol/srxl2.c
+@@ -1,4 +1,5 @@
+ #include "srxl2.h"
++#include "srxl2_channels.h"
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -155,9 +156,13 @@ static void process(void) {
+                                  SRXL2_DEVICE_INFO, SRXL2_DEVICE_UID);
+ 
+         }
+-        // Send telemetry
+-        else if (data[0] == SRXL2_HEADER && data[1] == SRXL2_PACKET_TYPE_CONTROL && data[4] == sensor_id_) {
+-            send_packet();
++        // Channel data (valid on every Control frame, independent of whose
++        // turn it is to answer with telemetry) + send telemetry on our turn
++        else if (data[0] == SRXL2_HEADER && data[1] == SRXL2_PACKET_TYPE_CONTROL) {
++            srxl2_channels_parse(data, length);
++            if (data[4] == sensor_id_) {
++                send_packet();
++            }
+         }
+         // Set baudrate
+         else if (data[0] == SRXL2_HEADER && data[1] == SRXL2_PACKET_TYPE_HANDSHAKE && data[4] == 0xFF) {
+diff --git a/board/project/protocol/srxl2_channels.c b/board/project/protocol/srxl2_channels.c
+new file mode 100644
+index 0000000..80bf53b
+--- /dev/null
++++ b/board/project/protocol/srxl2_channels.c
+@@ -0,0 +1,65 @@
++#include "srxl2_channels.h"
++
++#include <string.h>
++
++#include "FreeRTOS.h"
++#include "semphr.h"
++#include "srxl2.h"  // SRXL2_HEADER, SRXL2_PACKET_TYPE_CONTROL
++
++#define SRXL2_CMD_CHANNEL_DATA 0x00
++#define SRXL2_CMD_FAILSAFE_CHANNEL_DATA 0x01
++// 0x02 VTXData exists too, not relevant here.
++
++#define SRXL2_CTRL_OFF_COMMAND 3
++#define SRXL2_CTRL_OFF_CHANMASK 8
++#define SRXL2_CTRL_OFF_CHANDATA 12
++
++static srxl2_channels_t state;
++static SemaphoreHandle_t lock;
++
++static SemaphoreHandle_t get_lock(void) {
++    // Created lazily on first use so no separate explicit init call is
++    // needed from main.c; srxl2_task and any reader task both go
++    // through this before touching `state`.
++    if (lock == NULL) {
++        lock = xSemaphoreCreateMutex();
++    }
++    return lock;
++}
++
++void srxl2_channels_get(srxl2_channels_t *out) {
++    SemaphoreHandle_t m = get_lock();
++    xSemaphoreTake(m, portMAX_DELAY);
++    memcpy(out, &state, sizeof(state));
++    xSemaphoreGive(m);
++}
++
++void srxl2_channels_parse(const uint8_t *data, uint8_t length) {
++    if (length < SRXL2_CTRL_OFF_CHANDATA + 2) return;
++    if (data[0] != SRXL2_HEADER || data[1] != SRXL2_PACKET_TYPE_CONTROL) return;
++
++    uint8_t command = data[SRXL2_CTRL_OFF_COMMAND];
++    if (command != SRXL2_CMD_CHANNEL_DATA && command != SRXL2_CMD_FAILSAFE_CHANNEL_DATA) return;
++
++    uint32_t mask;
++    memcpy(&mask, &data[SRXL2_CTRL_OFF_CHANMASK], sizeof(mask));
++    if (mask == 0) return;  // dropped frame, per SRXL2 convention
++
++    SemaphoreHandle_t m = get_lock();
++    xSemaphoreTake(m, portMAX_DELAY);
++
++    uint8_t offset = SRXL2_CTRL_OFF_CHANDATA;
++    for (uint8_t ch = 0; ch < SRXL2_MAX_CHANNELS; ch++) {
++        if (!(mask & (1u << ch))) continue;
++        if (offset + 2 > length - 2) break;  // stay inside the frame, before the CRC
++        uint16_t value;
++        memcpy(&value, &data[offset], sizeof(value));
++        state.raw[ch] = value;
++        offset += 2;
++    }
++    state.mask |= mask;
++    state.failsafe = (command == SRXL2_CMD_FAILSAFE_CHANNEL_DATA);
++    state.frame_count++;
++
++    xSemaphoreGive(m);
++}
+diff --git a/board/project/protocol/srxl2_channels.h b/board/project/protocol/srxl2_channels.h
+new file mode 100644
+index 0000000..d83d03f
+--- /dev/null
++++ b/board/project/protocol/srxl2_channels.h
+@@ -0,0 +1,67 @@
++#ifndef SRXL2_CHANNELS_H
++#define SRXL2_CHANNELS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++// Decoded SRXL2 control-channel ("stick position") data.
++//
++// MSRC's own srxl2.c only ever inspected Control (0xCD) packets closely
++// enough to know "it's my turn to answer with telemetry" - it never
++// decoded the actual channel values carried in those packets, because
++// MSRC's job (sending sensor telemetry back to the transmitter) never
++// needed them. This module adds that missing decode step, so a second
++// consumer (e.g. a future RC-Cockpit task sharing this firmware image)
++// can read live channel/switch positions without touching the SRXL2
++// UART itself - srxl2.c remains the only code talking to the bus.
++//
++// Packet layout implemented here (SRXL2 Control packet, packetType
++// 0xCD, command 0x00 ChannelData / 0x01 FailsafeChannelData), verified
++// against the public SRXL2 spec and cross-checked against Betaflight's
++// rx/srxl2.c + rx/srxl2_types.h (an independent, flight-tested
++// implementation):
++//
++//   [0]      id            0xA6 (SRXL2_HEADER)
++//   [1]      packetType    0xCD (SRXL2_PACKET_TYPE_CONTROL)
++//   [2]      length
++//   [3]      command       0x00 ChannelData / 0x01 FailsafeChannelData / 0x02 VTXData
++//   [4]      replyId       device ID whose turn it is to answer with telemetry
++//                           (this is the byte MSRC's process() already compares
++//                           against sensor_id_ - channel data itself is valid
++//                           on every Control frame, regardless of replyId)
++//   [5]      rssi          int8_t
++//   [6..7]   frameLosses   uint16_t, little-endian
++//   [8..11]  channelMask   uint32_t, little-endian; bit N set = channel N present
++//   [12..]   uint16_t per set bit in channelMask, ascending bit order, little-endian
++//   [len-2..len-1] crc (big-endian; already handled by srxl2.c, not touched here)
++//
++// Channel values are centered on 0x8000 and span 0x0000..0xFFFF for the
++// full physical travel, equivalent to roughly 988..2012us of pulse width
++// (standard Spektrum convention) - see srxl2_channel_to_us() below.
++
++#define SRXL2_MAX_CHANNELS 32
++
++typedef struct srxl2_channels_t {
++    uint16_t raw[SRXL2_MAX_CHANNELS];  // last known raw value per channel (0x0000..0xFFFF)
++    uint32_t mask;                      // bitmask of channels ever seen so far
++    bool failsafe;                      // true if the most recently parsed frame was Failsafe ChannelData
++    uint32_t frame_count;               // increments on every successfully parsed ChannelData frame
++} srxl2_channels_t;
++
++// Thread-safe snapshot read, safe to call from any task other than the
++// one that owns the SRXL2 UART (i.e. anything other than srxl2_task).
++void srxl2_channels_get(srxl2_channels_t *out);
++
++// Converts a raw channel value (0x0000..0xFFFF, center 0x8000) to the
++// equivalent microsecond pulse width (~988..2012us, center 1500us).
++static inline float srxl2_channel_to_us(uint16_t raw_value) {
++    return ((float)(raw_value >> 2) / 16.0f) + 988.0f;
++}
++
++// Called from srxl2.c's process() for every received packet. Internally
++// verifies id/packetType/command and is a no-op for anything that isn't
++// a ChannelData or FailsafeChannelData Control packet - safe to call
++// unconditionally with the raw, CRC-checked frame buffer and its length.
++void srxl2_channels_parse(const uint8_t *data, uint8_t length);
++
++#endif
+-- 
+2.43.0
+

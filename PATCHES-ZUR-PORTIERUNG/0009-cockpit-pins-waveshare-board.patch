@@ -1,0 +1,219 @@
+From 71720520b2f7d9ef73bb54875de22be0295f0f51 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 16:46:09 +0200
+Subject: [PATCH] Move cockpit pins clear of MSRC's, add bootscreen-delay
+ config
+
+Ralph confirmed this chip will eventually also run real MSRC
+telemetry (vario/GPS/ESC/...), so the cockpit's display/servo/IMU
+pins need to live somewhere that never collides with constants.h's
+MSRC pins, not just document the overlap.
+
+This board is the RP2350B variant (48 GPIOs), and the pico-sdk ships
+its exact definition as "waveshare_core2350b" - the project was
+building against the generic 30-GPIO "pico2" (RP2350A) board instead,
+which is why there wasn't room before. Switching to the correct board
+(see README.md for the cmake command) exposes GPIO32-47, so every
+cockpit pin now sits at 32 or above, clear of MSRC's 0-15/26-29 and
+of the onboard LED/WS2812 pins (39/16). Verified by a full clean
+build against -DPICO_BOARD=waveshare_core2350b.
+
+Also in cockpit_pins.h: COCKPIT_BOOTSCREEN_MS, replacing a hardcoded
+4000 in cockpit_task.c, and a new cockpit/README.md collecting the
+build command, the pin file, and how to swap map_bitmap.h - one page
+to come back to instead of re-deriving it after a break.
+
+Not fixed here, flagged in both files: board/project/sensor/
+{voltage,current,ntc,airspeed}.c hardcode "+ 26" to get a GPIO from
+an ADC channel, which only matches the 30-GPIO board's ADC pins
+(26-29) - on this corrected board those are GPIO40-47 instead. Only
+matters if one of those four sensors is enabled on this chip; fix
+belongs on rp2350-port first per our branch split.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Rfc6e49BcxsziTxc1evta1
+---
+ board/project/cockpit/README.md      | 47 +++++++++++++++
+ board/project/cockpit/cockpit_pins.h | 85 +++++++++++++++++-----------
+ board/project/cockpit/cockpit_task.c |  3 +-
+ 3 files changed, 100 insertions(+), 35 deletions(-)
+ create mode 100644 board/project/cockpit/README.md
+
+diff --git a/board/project/cockpit/README.md b/board/project/cockpit/README.md
+new file mode 100644
+index 0000000..b73e2da
+--- /dev/null
++++ b/board/project/cockpit/README.md
+@@ -0,0 +1,47 @@
++# Cockpit extension (Core2350B)
++
++Quick reference for everything in this folder that's meant to be
++tweaked before a rebuild, without having to read the .c files first -
++useful after a break, or if the build environment ever has to be set
++up from scratch again.
++
++## Building
++
++This board is the RP2350B variant (48 GPIOs), and the pico-sdk ships
++its exact definition as `waveshare_core2350b`. Configure with:
++
++```
++cmake -S board -B build -DPICO_BOARD=waveshare_core2350b \
++      -DPICO_PLATFORM=rp2350-arm-s -DPICO_SDK_FETCH_FROM_GIT=on
++cmake --build build -j$(nproc)
++```
++
++Don't use `-DPICO_BOARD=pico2` - that's the generic 30-GPIO RP2350A
++board definition. It still compiles, but caps addressable GPIOs at
++29 (exactly the range MSRC's own pins already fill) and blinks the
++wrong onboard LED pin. Switching the board needs a fresh configure
++(delete `build/`, or point `-B` at a new folder), not just a rebuild.
++
++## Pins and timing: `cockpit_pins.h`
++
++Every GPIO the displays, the pilot-head servo and the IMU use, plus
++the bootscreen delay, are defined once in `cockpit_pins.h`. Change a
++value there and rebuild - nothing else in this folder hardcodes a pin
++number or that delay. All of them sit at GPIO32 and above on purpose,
++clear of `constants.h`'s MSRC pins (0-15, 26-29) and the onboard
++LED/WS2812 pins (16, 39), so this chip can run full MSRC telemetry
++(vario, GPS, ESC, fuel meter, ...) alongside the cockpit without a
++pin collision. GPIO44-46 are left free for the future Cockpit-Audio
++(ESP32->RP2350) pins; GPIO47 is the onboard PSRAM chip-select - leave
++that one alone.
++
++## Swapping the moving map: `map_bitmap.h`
++
++The map background is just a 128x128 RGB565 pixel array (`mapBitmap`)
++in `map_bitmap.h`, `#include`d by `map.c` - exactly how the original
++Arduino sketch kept its map image in its own header
++(`map_128x128_final.h`), separate from the rendering code. To use a
++different map, drop a new `map_bitmap.h` with the same array name and
++size in its place and rebuild - no other code needs to change. The
++screenshot -> header conversion workflow itself isn't written up yet
++(deferred until the rest of the port is running on real hardware).
+diff --git a/board/project/cockpit/cockpit_pins.h b/board/project/cockpit/cockpit_pins.h
+index 83d55a7..5279112 100644
+--- a/board/project/cockpit/cockpit_pins.h
++++ b/board/project/cockpit/cockpit_pins.h
+@@ -2,45 +2,62 @@
+ #define COCKPIT_PINS_H
+ 
+ /* Single place for every GPIO the cockpit extension (both displays,
+- * the pilot-head gaze servo, the IMU) uses on the Core2350B. Change
+- * a pin here and rebuild - nothing else under cockpit/ hardcodes a
+- * pin number anymore. This mirrors board/project/constants.h, which
+- * does the same job for MSRC's own receiver/sensor pins.
++ * the pilot-head gaze servo, the IMU) uses on the Core2350B, plus a
++ * couple of timing values worth tweaking without digging through the
++ * .c files. Change a value here and rebuild - nothing else under
++ * cockpit/ hardcodes a pin number or these timings anymore. This
++ * mirrors board/project/constants.h, which does the same job for
++ * MSRC's own receiver/sensor pins.
+  *
+- * These pins aren't a free choice we made - they come from the
+- * Core2350B's fixed display/IMU/servo wiring, inherited from the
+- * original Arduino sketch. Several of them happen to share a GPIO
+- * number with one of constants.h's defaults for a DIFFERENT MSRC
+- * feature (vario, GPS, ESC telemetry, ...). That's only a real
+- * conflict on a build that also enables that feature; known
+- * overlaps as of this writing:
+- *   GPIO 4/5  - also UART1_TX/RX_GPIO (ESC telemetry UART),
+- *               PWM_CAPTURE_GPIO / CASTLE_PWM_GPIO / CASTLE_ESC_GPIO
+- *   GPIO 6    - also UART_RX_PIO_GPIO (GPS tx)
+- *   GPIO 7    - also CLOCK_STRETCH_GPIO (npn switch)
+- *   GPIO 8/9  - also I2C0_SDA/SCL_GPIO (vario)
+- *   GPIO 12   - also SMART_ESC_PWM_GPIO
+- *   GPIO 14   - also UART_TX_PIO_GPIO (GPS rx)
+- *   GPIO 15   - also RESTORE_GPIO (config-reset button)
+- * If this particular chip ever also runs one of those MSRC features,
+- * move THAT feature's pin in constants.h rather than a cockpit pin
+- * here - the display/servo/IMU wiring is fixed on the board. */
++ * REQUIRES THE CORRECT BOARD: this chip is the RP2350B variant (48
++ * GPIOs, not 30), and the pico-sdk ships its exact board definition
++ * as "waveshare_core2350b". Configure with:
++ *   cmake -S board -B build -DPICO_BOARD=waveshare_core2350b \
++ *         -DPICO_PLATFORM=rp2350-arm-s -DPICO_SDK_FETCH_FROM_GIT=on
++ * NOT -DPICO_BOARD=pico2 (that's the generic 30-GPIO RP2350A board
++ * definition - it still compiles, but caps addressable GPIOs at 29,
++ * which is exactly the range constants.h's MSRC pins already fill,
++ * and it blinks the wrong onboard LED pin). Switching board needs a
++ * fresh cmake configure (delete build/ or point -B at a new folder),
++ * not just a rebuild.
++ *
++ * PIN BUDGET: constants.h's MSRC pins (0-15, 26-29), the onboard LED
++ * (GPIO39) and the WS2812 pin hardcoded in led.c (GPIO16) all live
++ * below GPIO32. Every cockpit pin below is >=32 on purpose, so this
++ * chip can run full MSRC telemetry (vario, GPS, ESC, fuel meter, ...)
++ * at the same time without any pin collision. GPIO47 is the onboard
++ * PSRAM chip-select (WAVESHARE_CORE2350B_PSRAM_CS_PIN) - leave it
++ * alone too. GPIO44-46 are free and reserved for the future
++ * Cockpit-Audio (ESP32->RP2350) pins.
++ *
++ * One pre-existing MSRC-core quirk this board switch exposes, not
++ * fixed here: board/project/sensor/{voltage,current,ntc,airspeed}.c
++ * hardcode "+ 26" to turn an ADC channel into a GPIO number. That's
++ * only correct on the 30-GPIO (RP2350A) ADC layout; on this RP2350B
++ * board the ADC pins are GPIO40-47, not 26-29. Harmless unless one of
++ * those four sensors gets enabled on this chip - flag it if/when
++ * that happens, fix belongs on rp2350-port first per our branch
++ * split. */
+ 
+ /* ---- Displays (2x ST7735, shared SPI0) ---- */
+-#define COCKPIT_PIN_SPI_SCK 6
+-#define COCKPIT_PIN_SPI_MOSI 7
+-#define COCKPIT_PIN_CS1 8   // Display 1 - PFD
+-#define COCKPIT_PIN_CS2 9   // Display 2 - Moving Map
+-#define COCKPIT_PIN_DC 12
+-#define COCKPIT_PIN_RST 13
+-#define COCKPIT_PIN_BL1 14
+-#define COCKPIT_PIN_BL2 15
++#define COCKPIT_PIN_IMU_SDA 32 /* blau - I2C0 SDA on this pin pair */
++#define COCKPIT_PIN_IMU_SCL 33 /* gelb - I2C0 SCL on this pin pair */
++#define COCKPIT_PIN_SPI_SCK 34   // SPI0 SCK on this pin pair
++#define COCKPIT_PIN_SPI_MOSI 35  // SPI0 TX/MOSI on this pin pair
++#define COCKPIT_PIN_CS1 36  // Display 1 - PFD
++#define COCKPIT_PIN_CS2 37  // Display 2 - Moving Map
++#define COCKPIT_PIN_DC 38
++#define COCKPIT_PIN_RST 40
++#define COCKPIT_PIN_BL1 41
++#define COCKPIT_PIN_BL2 42
+ 
+ /* ---- Pilot-head gaze servo ---- */
+-#define COCKPIT_PIN_PILOT_SERVO 21
++#define COCKPIT_PIN_PILOT_SERVO 43
+ 
+-/* ---- IMU (ICM-20948, I2C) ---- */
+-#define COCKPIT_PIN_IMU_SDA 4 /* blau */
+-#define COCKPIT_PIN_IMU_SCL 5 /* gelb */
++/* ---- Timing ---- */
++/* How long the one-time Garmin bootscreen stays up (ms) after the
++ * displays are first switched on, before the first real PFD/map
++ * frame is drawn. */
++#define COCKPIT_BOOTSCREEN_MS 4000
+ 
+ #endif /* COCKPIT_PINS_H */
+diff --git a/board/project/cockpit/cockpit_task.c b/board/project/cockpit/cockpit_task.c
+index 5006a1a..1c418f8 100644
+--- a/board/project/cockpit/cockpit_task.c
++++ b/board/project/cockpit/cockpit_task.c
+@@ -2,6 +2,7 @@
+ 
+ #include "bootscreen.h"
+ #include "cockpit_channels.h"
++#include "cockpit_pins.h"
+ #include "cockpit_switch.h"
+ #include "common.h"
+ #include "compat.h"
+@@ -104,7 +105,7 @@ void cockpit_task(void *parameters) {
+             backlightIsOn = true;
+             bootscreenShown = true;
+             showingBootscreen = true;
+-            bootscreenUntilMs = to_ms_since_boot(get_absolute_time()) + 4000;
++            bootscreenUntilMs = to_ms_since_boot(get_absolute_time()) + COCKPIT_BOOTSCREEN_MS;
+         }
+ 
+         if (showingBootscreen && !displayEnabled) {
+-- 
+2.43.0
+

@@ -1,0 +1,184 @@
+From 8e8273c162025eb3f27051e7b69aa6109ebedf35 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 20:09:49 +0200
+Subject: [PATCH] Wire the cockpit display module into a FreeRTOS task
+
+Adds cockpit_task.c/.h: brings up both panels via
+cockpitDisplayBegin(), shows the boot splash once, then loops
+rendering the PFD onto CS1 and the moving map onto CS2.
+
+Started from main.c alongside srxl2_task, at lower priority (1 vs
+srxl2_task's 3) so rendering never delays SRXL2 frame handling.
+
+Pitch/roll/heading are a synthetic sweep for now, not read from the
+IMU (not ported yet) - this is purely so the panels visibly come
+alive once flashed, as a checkpoint before the servo and IMU ports.
+Airspeed/altitude/VSI reuse the same fixed demo values the original
+Arduino sketch used.
+
+Builds and links cleanly (0 warnings) on top of the previous
+display-driver-and-renderer patch.
+---
+ board/project/cockpit/CMakeLists.txt |  1 +
+ board/project/cockpit/cockpit_task.c | 85 ++++++++++++++++++++++++++++
+ board/project/cockpit/cockpit_task.h | 10 ++++
+ board/project/constants.h            |  2 +
+ board/project/main.c                 |  4 ++
+ 5 files changed, 102 insertions(+)
+ create mode 100644 board/project/cockpit/cockpit_task.c
+ create mode 100644 board/project/cockpit/cockpit_task.h
+
+diff --git a/board/project/cockpit/CMakeLists.txt b/board/project/cockpit/CMakeLists.txt
+index ea3a114..479b821 100644
+--- a/board/project/cockpit/CMakeLists.txt
++++ b/board/project/cockpit/CMakeLists.txt
+@@ -3,4 +3,5 @@ target_sources(${PROJECT_NAME} PRIVATE
+     pfd.c
+     map.c
+     bootscreen.c
++    cockpit_task.c
+ )
+diff --git a/board/project/cockpit/cockpit_task.c b/board/project/cockpit/cockpit_task.c
+new file mode 100644
+index 0000000..13bfd3a
+--- /dev/null
++++ b/board/project/cockpit/cockpit_task.c
+@@ -0,0 +1,85 @@
++#include "cockpit_task.h"
++
++#include <math.h>
++
++#include "bootscreen.h"
++#include "compat.h"
++#include "display.h"
++#include "map.h"
++#include "pfd.h"
++
++/* Owns both panels end to end: brings up the SPI driver and
++ * framebuffers, shows the boot splash once, then renders the PFD
++ * (CS1) and the moving map (CS2) in a loop.
++ *
++ * Nothing here reads real sensor or SRXL2 data yet - pitch/roll/
++ * heading are a gentle synthetic sweep, purely so the panels
++ * visibly come alive once this is flashed, standing in for the IMU
++ * and servo work that comes next. Airspeed/altitude/VSI reuse the
++ * same fixed demo values the original Arduino sketch used, and
++ * ownLat/ownLon (in map.c) never change yet either, so the map's
++ * breadcrumb track stays put - also matching the original demo. */
++
++void cockpit_task(void *parameters) {
++    (void)parameters;
++
++    cockpitDisplayBegin();
++
++    showGarminBootscreen();
++    cockpitDisplayPushBootscreen();
++    vTaskDelay(pdMS_TO_TICKS(4000));
++
++    float heading = 0.0f;
++
++    while (1) {
++        heading += 1.0f;
++        if (heading >= 360.0f) heading -= 360.0f;
++
++        float pitch = 15.0f * sinf(heading * DEG_TO_RAD);
++        float roll = 25.0f * sinf(2.0f * heading * DEG_TO_RAD);
++
++        int ihdg = (int)heading;
++        int bug = (ihdg + 45) % 360;
++        int course = (ihdg + 30) % 360;
++        int bearing = (ihdg + 90) % 360;
++        int spd = 140;
++        int alt = 6000;
++        int vsi = 0;
++
++        /* ---- PFD, pushed to CS1 ---- */
++        clearFB(COL_BLACK);
++        drawHorizon(pitch, roll);
++        drawPitchLadder(pitch, roll);
++        drawRollScale();
++        drawCoursePointer(ihdg, course);
++        drawBearingPointer(ihdg, bearing);
++        drawCDIScale();
++        drawCDI(course, bearing);
++        drawToFromText(course, bearing);
++        drawHeadingTape(ihdg, bug);
++        drawHeadingWindow(ihdg);
++        renderAirspeedTape(spd);
++        drawSpeedWindow(spd);
++        renderAltitudeTape(alt);
++        drawAltitudeWindow(alt);
++        drawVSI(vsi);
++        drawVSINumber();
++        drawAircraft();
++        cockpitDisplaySwapAndPush(COCKPIT_PIN_CS1);
++
++        /* ---- Moving map, pushed to CS2 ---- */
++        clearFB(COL_BLACK);
++        trackLat[trackHead] = ownLat;
++        trackLon[trackHead] = ownLon;
++        trackHead = (trackHead + 1) % TRACK_LEN;
++        if (trackHead == 0) trackFilled = true;
++
++        drawMapBackground();
++        drawMapTrack(ownLat, ownLon, ihdg);
++        drawMapHeadingArrow(ihdg);
++        drawMapAircraftChevron(ihdg);
++        cockpitDisplaySwapAndPush(COCKPIT_PIN_CS2);
++
++        vTaskDelay(pdMS_TO_TICKS(50));
++    }
++}
+diff --git a/board/project/cockpit/cockpit_task.h b/board/project/cockpit/cockpit_task.h
+new file mode 100644
+index 0000000..d1f4706
+--- /dev/null
++++ b/board/project/cockpit/cockpit_task.h
+@@ -0,0 +1,10 @@
++#ifndef COCKPIT_TASK_H
++#define COCKPIT_TASK_H
++
++#include "common.h"
++
++/* FreeRTOS task that owns both cockpit panels (PFD on CS1, moving map
++ * on CS2). Started from main.c alongside srxl2_task. */
++void cockpit_task(void *parameters);
++
++#endif /* COCKPIT_TASK_H */
+diff --git a/board/project/constants.h b/board/project/constants.h
+index e336784..8e797df 100644
+--- a/board/project/constants.h
++++ b/board/project/constants.h
+@@ -118,6 +118,8 @@
+ #define STACK_USB (196 + STACK_EXTRA)
+ #define STACK_LED (186 + STACK_EXTRA)
+ 
++#define STACK_COCKPIT (2000 + STACK_EXTRA)
++
+ /* RPM multiplier */
+ #define RPM_MULTIPLIER (RPM_PINION_TEETH / (1.0 * RPM_MAIN_TEETH * RPM_PAIR_OF_POLES))
+ 
+diff --git a/board/project/main.c b/board/project/main.c
+index 33376d9..6867c51 100644
+--- a/board/project/main.c
++++ b/board/project/main.c
+@@ -1,5 +1,6 @@
+ #include <stdio.h>
+ 
++#include "cockpit_task.h"
+ #include "config.h"
+ #include "crsf.h"
+ #include "dbg_task.h"
+@@ -102,6 +103,9 @@ int main() {
+         case RX_SRXL2:
+             xTaskCreate(srxl2_task, "srxl2_task", STACK_RX_SRXL2, NULL, 3, &context.receiver_task_handle);
+             context.uart0_notify_task_handle = context.receiver_task_handle;
++            // Cockpit display panels (PFD + moving map). Lower priority than the
++            // receiver task so rendering never delays SRXL2 frame handling.
++            xTaskCreate(cockpit_task, "cockpit_task", STACK_COCKPIT, NULL, 1, NULL);
+             break;
+         case SERIAL_MONITOR:
+             xTaskCreate(serial_monitor_task, "serial_monitor", STACK_SERIAL_MONITOR, NULL, 3,
+-- 
+2.43.0
+

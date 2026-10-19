@@ -35,12 +35,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "cockpit_pins.h" /* COCKPIT_PIN_IMU_SDA / _SCL */
 #include "common.h"
 
 extern context_t context;
-
-#define COCKPIT_PIN_IMU_SDA 4 /* blau */
-#define COCKPIT_PIN_IMU_SCL 5 /* gelb */
 
 /* Initialisiert I2C-Bus und ICM-20948 (inkl. Magnetometer).
  * Gibt false zurueck, wenn der Sensor nicht gefunden wurde. */

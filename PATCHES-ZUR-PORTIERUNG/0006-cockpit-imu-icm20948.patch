@@ -1,0 +1,5480 @@
+From 3a4978ebd5a985a5bc557318ec0bc3f06bd768d1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 13:17:46 +0200
+Subject: [PATCH] Port RC-Cockpit's IMU module (ICM-20948) to pico-sdk
+ hardware_i2c
+
+Replaces the Arduino SparkFun ICM_20948 wrapper classes with the
+library's own platform-independent C core (vendored into
+cockpit/icm20948/, MIT-licensed, see its README.md), linked to a
+small hardware_i2c-based Serif instead of Wire. The sensor-fusion
+math itself - complementary filter for pitch/roll, tilt-compensated
+magnetometer heading, heading smoothing, slip indicator, the 180
+degree mounting correction - is a straight port of imu.cpp.
+
+cockpit_task now calls imuBegin()/imuUpdate() and feeds real pitch/
+roll/heading into the PFD, map and pilot-head servo, replacing the
+synthetic demo sweep. If the IMU isn't found at startup, it logs via
+the existing debug() facility and the loop continues with pitch/
+roll/heading at 0 rather than failing, so the rest of the panel and
+the servo still come up without the sensor wired.
+---
+ board/project/cockpit/CMakeLists.txt          |    2 +
+ board/project/cockpit/cockpit_task.c          |   41 +-
+ board/project/cockpit/cockpit_task.h          |    2 +
+ .../cockpit/icm20948/AK09916_ENUMERATIONS.h   |   15 +
+ .../cockpit/icm20948/AK09916_REGISTERS.h      |   83 +
+ board/project/cockpit/icm20948/ICM_20948_C.c  | 2636 +++++++++++++++++
+ board/project/cockpit/icm20948/ICM_20948_C.h  |  311 ++
+ .../project/cockpit/icm20948/ICM_20948_DMP.h  |  695 +++++
+ .../cockpit/icm20948/ICM_20948_ENUMERATIONS.h |  263 ++
+ .../cockpit/icm20948/ICM_20948_REGISTERS.h    |  810 +++++
+ board/project/cockpit/icm20948/README.md      |   44 +
+ board/project/cockpit/imu.c                   |  350 +++
+ board/project/cockpit/imu.h                   |   58 +
+ 13 files changed, 5290 insertions(+), 20 deletions(-)
+ create mode 100644 board/project/cockpit/icm20948/AK09916_ENUMERATIONS.h
+ create mode 100644 board/project/cockpit/icm20948/AK09916_REGISTERS.h
+ create mode 100644 board/project/cockpit/icm20948/ICM_20948_C.c
+ create mode 100644 board/project/cockpit/icm20948/ICM_20948_C.h
+ create mode 100644 board/project/cockpit/icm20948/ICM_20948_DMP.h
+ create mode 100644 board/project/cockpit/icm20948/ICM_20948_ENUMERATIONS.h
+ create mode 100644 board/project/cockpit/icm20948/ICM_20948_REGISTERS.h
+ create mode 100644 board/project/cockpit/icm20948/README.md
+ create mode 100644 board/project/cockpit/imu.c
+ create mode 100644 board/project/cockpit/imu.h
+
+diff --git a/board/project/cockpit/CMakeLists.txt b/board/project/cockpit/CMakeLists.txt
+index 03fbf5e..95e0b73 100644
+--- a/board/project/cockpit/CMakeLists.txt
++++ b/board/project/cockpit/CMakeLists.txt
+@@ -5,4 +5,6 @@ target_sources(${PROJECT_NAME} PRIVATE
+     bootscreen.c
+     cockpit_task.c
+     piloten.c
++    imu.c
++    icm20948/ICM_20948_C.c
+ )
+diff --git a/board/project/cockpit/cockpit_task.c b/board/project/cockpit/cockpit_task.c
+index 7a78b37..9126571 100644
+--- a/board/project/cockpit/cockpit_task.c
++++ b/board/project/cockpit/cockpit_task.c
+@@ -1,10 +1,9 @@
+ #include "cockpit_task.h"
+ 
+-#include <math.h>
+-
+ #include "bootscreen.h"
+-#include "compat.h"
++#include "common.h"
+ #include "display.h"
++#include "imu.h"
+ #include "map.h"
+ #include "pfd.h"
+ #include "piloten.h"
+@@ -12,17 +11,18 @@
+ /* Owns both panels end to end: brings up the SPI driver and
+  * framebuffers, shows the boot splash once, then renders the PFD
+  * (CS1) and the moving map (CS2) in a loop, while also driving the
+- * pilot head's gaze servo.
++ * pilot head's gaze servo from real IMU attitude data.
+  *
+- * Nothing here reads real sensor or SRXL2 data yet - pitch/roll/
+- * heading are a gentle synthetic sweep, purely so the panels
+- * visibly come alive once this is flashed, standing in for the IMU
+- * work that comes next (the servo gaze module itself is already the
+- * real port, just fed a synthetic roll for now). Airspeed/altitude/
+- * VSI reuse the same fixed demo values the original Arduino sketch
+- * used, and ownLat/ownLon (in map.c) never change yet either, so the
+- * map's breadcrumb track stays put - also matching the original
+- * demo. */
++ * Pitch/roll/heading now come from the ICM-20948 IMU (see imu.c) -
++ * no more synthetic sweep. If the sensor isn't found at startup
++ * (not wired up yet, or a bad connection), imuBegin() logs it and
++ * the loop keeps running with pitch/roll/heading simply at 0 rather
++ * than crashing, so the rest of the panel - map, airspeed/altitude/
++ * VSI, pilot head - still comes up. Airspeed/altitude/VSI still
++ * reuse the same fixed demo values the original Arduino sketch
++ * used (no ESC/airspeed sensor port yet), and ownLat/ownLon (in
++ * map.c) never change yet either, so the map's breadcrumb track
++ * stays put - also matching the original demo. */
+ 
+ void cockpit_task(void *parameters) {
+     (void)parameters;
+@@ -30,18 +30,20 @@ void cockpit_task(void *parameters) {
+     cockpitDisplayBegin();
+     pilotenBegin(COCKPIT_PIN_PILOT_SERVO);
+ 
++    if (!imuBegin(COCKPIT_PIN_IMU_SDA, COCKPIT_PIN_IMU_SCL)) {
++        debug("\ncockpit_task: IMU nicht gefunden - Pitch/Roll/Heading bleiben auf 0");
++    }
++
+     showGarminBootscreen();
+     cockpitDisplayPushBootscreen();
+     vTaskDelay(pdMS_TO_TICKS(4000));
+ 
+-    float heading = 0.0f;
+-
+     while (1) {
+-        heading += 1.0f;
+-        if (heading >= 360.0f) heading -= 360.0f;
++        imuUpdate();
+ 
+-        float pitch = 15.0f * sinf(heading * DEG_TO_RAD);
+-        float roll = 25.0f * sinf(2.0f * heading * DEG_TO_RAD);
++        float pitch = imuGetPitch();
++        float roll = imuGetRoll();
++        int ihdg = imuGetHeading();
+ 
+         pilotenSetRoll(roll);
+         pilotenUpdate(); /* 1. update, before rendering - matches the
+@@ -49,7 +51,6 @@ void cockpit_task(void *parameters) {
+                            * once more after each panel push" pattern,
+                            * trimmed from 4 panels to this board's 2. */
+ 
+-        int ihdg = (int)heading;
+         int bug = (ihdg + 45) % 360;
+         int course = (ihdg + 30) % 360;
+         int bearing = (ihdg + 90) % 360;
+diff --git a/board/project/cockpit/cockpit_task.h b/board/project/cockpit/cockpit_task.h
+index d1f4706..6d7c3fd 100644
+--- a/board/project/cockpit/cockpit_task.h
++++ b/board/project/cockpit/cockpit_task.h
+@@ -3,6 +3,8 @@
+ 
+ #include "common.h"
+ 
++extern context_t context;
++
+ /* FreeRTOS task that owns both cockpit panels (PFD on CS1, moving map
+  * on CS2). Started from main.c alongside srxl2_task. */
+ void cockpit_task(void *parameters);
+diff --git a/board/project/cockpit/icm20948/AK09916_ENUMERATIONS.h b/board/project/cockpit/icm20948/AK09916_ENUMERATIONS.h
+new file mode 100644
+index 0000000..b62b7c3
+--- /dev/null
++++ b/board/project/cockpit/icm20948/AK09916_ENUMERATIONS.h
+@@ -0,0 +1,15 @@
++#ifndef _AK09916_ENUMERATIONS_H_
++#define _AK09916_ENUMERATIONS_H_
++
++typedef enum
++{
++  AK09916_mode_power_down = 0x00,
++  AK09916_mode_single = (0x01 << 0),
++  AK09916_mode_cont_10hz = (0x01 << 1),
++  AK09916_mode_cont_20hz = (0x02 << 1),
++  AK09916_mode_cont_50hz = (0x03 << 1),
++  AK09916_mode_cont_100hz = (0x04 << 1),
++  AK09916_mode_self_test = (0x01 << 4),
++} AK09916_mode_e;
++
++#endif // _AK09916_ENUMERATIONS_H_
+\ No newline at end of file
+diff --git a/board/project/cockpit/icm20948/AK09916_REGISTERS.h b/board/project/cockpit/icm20948/AK09916_REGISTERS.h
+new file mode 100644
+index 0000000..9c91c3c
+--- /dev/null
++++ b/board/project/cockpit/icm20948/AK09916_REGISTERS.h
+@@ -0,0 +1,83 @@
++#ifndef _AK09916_REGISTERS_H_
++#define _AK09916_REGISTERS_H_
++
++#include <stdint.h>
++
++typedef enum
++{
++  AK09916_REG_WIA1 = 0x00,
++  AK09916_REG_WIA2,
++  AK09916_REG_RSV1,
++  AK09916_REG_RSV2, // Reserved register. We start reading here when using the DMP. Secret sauce...
++  // discontinuity - containing another nine reserved registers? Secret sauce...
++  AK09916_REG_ST1 = 0x10,
++  AK09916_REG_HXL,
++  AK09916_REG_HXH,
++  AK09916_REG_HYL,
++  AK09916_REG_HYH,
++  AK09916_REG_HZL,
++  AK09916_REG_HZH,
++  // discontinuity
++  AK09916_REG_ST2 = 0x18,
++  // discontinuity
++  AK09916_REG_CNTL2 = 0x31,
++  AK09916_REG_CNTL3,
++} AK09916_Reg_Addr_e;
++
++typedef struct
++{
++  uint8_t WIA1;
++} AK09916_WIA1_Reg_t;
++
++typedef struct
++{
++  uint8_t WIA2;
++} AK09916_WIA2_Reg_t;
++
++typedef struct
++{
++  uint8_t DRDY : 1;
++  uint8_t DOR : 1;
++  uint8_t reserved_0 : 6;
++} AK09916_ST1_Reg_t;
++
++// typedef struct{
++
++// }AK09916_HXL_Reg_t;
++
++// typedef struct{
++
++// }AK09916_HXH_Reg_t;
++// typedef struct{
++
++// }AK09916_HYL_Reg_t;
++// typedef struct{
++
++// }AK09916_HYH_Reg_t;
++// typedef struct{
++
++// }AK09916_HZL_Reg_t;
++// typedef struct{
++
++// }AK09916_HZH_Reg_t;
++
++typedef struct
++{
++  uint8_t reserved_0 : 3;
++  uint8_t HOFL : 1;
++  uint8_t reserved_1 : 4;
++} AK09916_ST2_Reg_t;
++
++typedef struct
++{
++  uint8_t MODE : 5;
++  uint8_t reserved_0 : 3;
++} AK09916_CNTL2_Reg_t;
++
++typedef struct
++{
++  uint8_t SRST : 1;
++  uint8_t reserved_0 : 7;
++} AK09916_CNTL3_Reg_t;
++
++#endif // _AK09916_REGISTERS_H_
+diff --git a/board/project/cockpit/icm20948/ICM_20948_C.c b/board/project/cockpit/icm20948/ICM_20948_C.c
+new file mode 100644
+index 0000000..969e144
+--- /dev/null
++++ b/board/project/cockpit/icm20948/ICM_20948_C.c
+@@ -0,0 +1,2636 @@
++#include "ICM_20948_C.h"
++#include "ICM_20948_REGISTERS.h"
++#include "AK09916_REGISTERS.h"
++
++/*
++ * Icm20948 device require a DMP image to be loaded on init
++ * Provide such images by mean of a byte array
++*/
++#if defined(ICM_20948_USE_DMP) // Only include the 14301 Bytes of DMP if ICM_20948_USE_DMP is defined
++
++#if defined(ARDUINO_ARCH_MBED) // ARDUINO_ARCH_MBED (APOLLO3 v2) does not support or require pgmspace.h / PROGMEM
++const uint8_t dmp3_image[] = {
++#elif (defined(__AVR__) || defined(__arm__) || defined(__ARDUINO_ARC__) || defined(ESP8266)) && !defined(__linux__) // Store the DMP firmware in PROGMEM on older AVR (ATmega) platforms
++#define ICM_20948_USE_PROGMEM_FOR_DMP
++#include <avr/pgmspace.h>
++const uint8_t dmp3_image[] PROGMEM = {
++#else
++const uint8_t dmp3_image[] = {
++#endif
++
++#include "icm20948_img.dmp3a.h"
++};
++#endif
++
++// ICM-20948 data is big-endian. We need to make it little-endian when writing into icm_20948_DMP_data_t
++const int DMP_Quat9_Byte_Ordering[icm_20948_DMP_Quat9_Bytes] =
++    {
++        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 13, 12 // Also used for Geomag
++};
++const int DMP_Quat6_Byte_Ordering[icm_20948_DMP_Quat6_Bytes] =
++    {
++        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8 // Also used for Gyro_Calibr, Compass_Calibr
++};
++const int DMP_PQuat6_Byte_Ordering[icm_20948_DMP_PQuat6_Bytes] =
++    {
++        1, 0, 3, 2, 5, 4 // Also used for Raw_Accel, Compass
++};
++const int DMP_Raw_Gyro_Byte_Ordering[icm_20948_DMP_Raw_Gyro_Bytes + icm_20948_DMP_Gyro_Bias_Bytes] =
++    {
++        1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10};
++const int DMP_Activity_Recognition_Byte_Ordering[icm_20948_DMP_Activity_Recognition_Bytes] =
++    {
++        0, 1, 5, 4, 3, 2};
++const int DMP_Secondary_On_Off_Byte_Ordering[icm_20948_DMP_Secondary_On_Off_Bytes] =
++    {
++        1, 0};
++
++const uint16_t inv_androidSensor_to_control_bits[ANDROID_SENSOR_NUM_MAX] =
++    {
++        // Data output control 1 register bit definition
++        // 16-bit accel                                0x8000
++        // 16-bit gyro                                 0x4000
++        // 16-bit compass                              0x2000
++        // 16-bit ALS                                  0x1000
++        // 32-bit 6-axis quaternion                    0x0800
++        // 32-bit 9-axis quaternion + heading accuracy 0x0400
++        // 16-bit pedometer quaternion                 0x0200
++        // 32-bit Geomag rv + heading accuracy         0x0100
++        // 16-bit Pressure                             0x0080
++        // 32-bit calibrated gyro                      0x0040
++        // 32-bit calibrated compass                   0x0020
++        // Pedometer Step Detector                     0x0010
++        // Header 2                                    0x0008
++        // Pedometer Step Indicator Bit 2              0x0004
++        // Pedometer Step Indicator Bit 1              0x0002
++        // Pedometer Step Indicator Bit 0              0x0001
++        // Unsupported Sensors are 0xFFFF
++
++        0xFFFF, // 0  Meta Data
++        0x8008, // 1  Accelerometer
++        0x0028, // 2  Magnetic Field
++        0x0408, // 3  Orientation
++        0x4048, // 4  Gyroscope
++        0x1008, // 5  Light
++        0x0088, // 6  Pressure
++        0xFFFF, // 7  Temperature
++        0xFFFF, // 8  Proximity <----------- fixme
++        0x0808, // 9  Gravity
++        0x8808, // 10 Linear Acceleration
++        0x0408, // 11 Rotation Vector
++        0xFFFF, // 12 Humidity
++        0xFFFF, // 13 Ambient Temperature
++        0x2008, // 14 Magnetic Field Uncalibrated
++        0x0808, // 15 Game Rotation Vector
++        0x4008, // 16 Gyroscope Uncalibrated
++        0x0000, // 17 Significant Motion
++        0x0018, // 18 Step Detector
++        0x0010, // 19 Step Counter <----------- fixme
++        0x0108, // 20 Geomagnetic Rotation Vector
++        0xFFFF, // 21 ANDROID_SENSOR_HEART_RATE,
++        0xFFFF, // 22 ANDROID_SENSOR_PROXIMITY,
++
++        0x8008, // 23 ANDROID_SENSOR_WAKEUP_ACCELEROMETER,
++        0x0028, // 24 ANDROID_SENSOR_WAKEUP_MAGNETIC_FIELD,
++        0x0408, // 25 ANDROID_SENSOR_WAKEUP_ORIENTATION,
++        0x4048, // 26 ANDROID_SENSOR_WAKEUP_GYROSCOPE,
++        0x1008, // 27 ANDROID_SENSOR_WAKEUP_LIGHT,
++        0x0088, // 28 ANDROID_SENSOR_WAKEUP_PRESSURE,
++        0x0808, // 29 ANDROID_SENSOR_WAKEUP_GRAVITY,
++        0x8808, // 30 ANDROID_SENSOR_WAKEUP_LINEAR_ACCELERATION,
++        0x0408, // 31 ANDROID_SENSOR_WAKEUP_ROTATION_VECTOR,
++        0xFFFF, // 32 ANDROID_SENSOR_WAKEUP_RELATIVE_HUMIDITY,
++        0xFFFF, // 33 ANDROID_SENSOR_WAKEUP_AMBIENT_TEMPERATURE,
++        0x2008, // 34 ANDROID_SENSOR_WAKEUP_MAGNETIC_FIELD_UNCALIBRATED,
++        0x0808, // 35 ANDROID_SENSOR_WAKEUP_GAME_ROTATION_VECTOR,
++        0x4008, // 36 ANDROID_SENSOR_WAKEUP_GYROSCOPE_UNCALIBRATED,
++        0x0018, // 37 ANDROID_SENSOR_WAKEUP_STEP_DETECTOR,
++        0x0010, // 38 ANDROID_SENSOR_WAKEUP_STEP_COUNTER,
++        0x0108, // 39 ANDROID_SENSOR_WAKEUP_GEOMAGNETIC_ROTATION_VECTOR
++        0xFFFF, // 40 ANDROID_SENSOR_WAKEUP_HEART_RATE,
++        0x0000, // 41 ANDROID_SENSOR_WAKEUP_TILT_DETECTOR,
++        0x8008, // 42 Raw Acc
++        0x4048, // 43 Raw Gyr
++};
++
++const ICM_20948_Serif_t NullSerif = {
++    NULL, // write
++    NULL, // read
++    NULL, // user
++};
++
++// Private function prototypes
++
++// Function definitions
++ICM_20948_Status_e ICM_20948_init_struct(ICM_20948_Device_t *pdev)
++{
++  // Initialize all elements by 0 except for _last_bank
++  // Initialize _last_bank to 4 (invalid bank number)
++  // so ICM_20948_set_bank function does not skip issuing bank change operation
++  static const ICM_20948_Device_t init_device = { ._last_bank = 4 };
++  *pdev = init_device;
++  return ICM_20948_Stat_Ok;
++}
++
++ICM_20948_Status_e ICM_20948_link_serif(ICM_20948_Device_t *pdev, const ICM_20948_Serif_t *s)
++{
++  if (s == NULL)
++  {
++    return ICM_20948_Stat_ParamErr;
++  }
++  if (pdev == NULL)
++  {
++    return ICM_20948_Stat_ParamErr;
++  }
++  pdev->_serif = s;
++  return ICM_20948_Stat_Ok;
++}
++
++ICM_20948_Status_e ICM_20948_execute_w(ICM_20948_Device_t *pdev, uint8_t regaddr, uint8_t *pdata, uint32_t len)
++{
++  if (pdev->_serif->write == NULL)
++  {
++    return ICM_20948_Stat_NotImpl;
++  }
++  return (*pdev->_serif->write)(regaddr, pdata, len, pdev->_serif->user);
++}
++
++ICM_20948_Status_e ICM_20948_execute_r(ICM_20948_Device_t *pdev, uint8_t regaddr, uint8_t *pdata, uint32_t len)
++{
++  if (pdev->_serif->read == NULL)
++  {
++    return ICM_20948_Stat_NotImpl;
++  }
++  return (*pdev->_serif->read)(regaddr, pdata, len, pdev->_serif->user);
++}
++
++//Transact directly with an I2C device, one byte at a time
++//Used to configure a device before it is setup into a normal 0-3 peripheral slot
++ICM_20948_Status_e ICM_20948_i2c_controller_periph4_txn(ICM_20948_Device_t *pdev, uint8_t addr, uint8_t reg, uint8_t *data, uint8_t len, bool Rw, bool send_reg_addr)
++{
++  // Thanks MikeFair! // https://github.com/kriswiner/MPU9250/issues/86
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  addr = (((Rw) ? 0x80 : 0x00) | addr);
++
++  retval = ICM_20948_set_bank(pdev, 3);
++  retval = ICM_20948_execute_w(pdev, AGB3_REG_I2C_PERIPH4_ADDR, (uint8_t *)&addr, 1);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_set_bank(pdev, 3);
++  retval = ICM_20948_execute_w(pdev, AGB3_REG_I2C_PERIPH4_REG, (uint8_t *)&reg, 1);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  ICM_20948_I2C_PERIPH4_CTRL_t ctrl;
++  ctrl.EN = 1;
++  ctrl.INT_EN = false;
++  ctrl.DLY = 0;
++  ctrl.REG_DIS = !send_reg_addr;
++
++  ICM_20948_I2C_MST_STATUS_t i2c_mst_status;
++  bool txn_failed = false;
++  uint16_t nByte = 0;
++
++  while (nByte < len)
++  {
++    if (!Rw)
++    {
++      retval = ICM_20948_set_bank(pdev, 3);
++      retval = ICM_20948_execute_w(pdev, AGB3_REG_I2C_PERIPH4_DO, (uint8_t *)&(data[nByte]), 1);
++      if (retval != ICM_20948_Stat_Ok)
++      {
++        return retval;
++      }
++    }
++
++    // Kick off txn
++    retval = ICM_20948_set_bank(pdev, 3);
++    retval = ICM_20948_execute_w(pdev, AGB3_REG_I2C_PERIPH4_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_I2C_PERIPH4_CTRL_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++
++    // long tsTimeout = millis() + 3000;  // Emergency timeout for txn (hard coded to 3 secs)
++    uint32_t max_cycles = 1000;
++    uint32_t count = 0;
++    bool peripheral4Done = false;
++    while (!peripheral4Done)
++    {
++      retval = ICM_20948_set_bank(pdev, 0);
++      retval = ICM_20948_execute_r(pdev, AGB0_REG_I2C_MST_STATUS, (uint8_t *)&i2c_mst_status, 1);
++
++      peripheral4Done = (i2c_mst_status.I2C_PERIPH4_DONE /*| (millis() > tsTimeout) */); //Avoid forever-loops
++      peripheral4Done |= (count >= max_cycles);
++      count++;
++    }
++    txn_failed = (i2c_mst_status.I2C_PERIPH4_NACK /*| (millis() > tsTimeout) */);
++    txn_failed |= (count >= max_cycles);
++    if (txn_failed)
++      break;
++
++    if (Rw)
++    {
++      retval = ICM_20948_set_bank(pdev, 3);
++      retval = ICM_20948_execute_r(pdev, AGB3_REG_I2C_PERIPH4_DI, &data[nByte], 1);
++    }
++
++    nByte++;
++  }
++
++  if (txn_failed)
++  {
++    //We often fail here if mag is stuck
++    return ICM_20948_Stat_Err;
++  }
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_i2c_master_single_w(ICM_20948_Device_t *pdev, uint8_t addr, uint8_t reg, uint8_t *data)
++{
++  return ICM_20948_i2c_controller_periph4_txn(pdev, addr, reg, data, 1, false, true);
++}
++
++ICM_20948_Status_e ICM_20948_i2c_master_single_r(ICM_20948_Device_t *pdev, uint8_t addr, uint8_t reg, uint8_t *data)
++{
++  return ICM_20948_i2c_controller_periph4_txn(pdev, addr, reg, data, 1, true, true);
++}
++
++ICM_20948_Status_e ICM_20948_set_bank(ICM_20948_Device_t *pdev, uint8_t bank)
++{
++  if (bank > 3)
++  {
++    return ICM_20948_Stat_ParamErr;
++  } // Only 4 possible banks
++
++  if (bank == pdev->_last_bank) // Do we need to change bank?
++    return ICM_20948_Stat_Ok;   // Bail if we don't need to change bank to avoid unnecessary bus traffic
++
++  pdev->_last_bank = bank;   // Store the requested bank (before we bit-shift)
++  bank = (bank << 4) & 0x30; // bits 5:4 of REG_BANK_SEL
++  return ICM_20948_execute_w(pdev, REG_BANK_SEL, &bank, 1);
++}
++
++ICM_20948_Status_e ICM_20948_sw_reset(ICM_20948_Device_t *pdev)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  ICM_20948_PWR_MGMT_1_t reg;
++
++  ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_PWR_MGMT_1, (uint8_t *)&reg, sizeof(ICM_20948_PWR_MGMT_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  reg.DEVICE_RESET = 1;
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_PWR_MGMT_1, (uint8_t *)&reg, sizeof(ICM_20948_PWR_MGMT_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_sleep(ICM_20948_Device_t *pdev, bool on)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  ICM_20948_PWR_MGMT_1_t reg;
++
++  ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_PWR_MGMT_1, (uint8_t *)&reg, sizeof(ICM_20948_PWR_MGMT_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  if (on)
++  {
++    reg.SLEEP = 1;
++  }
++  else
++  {
++    reg.SLEEP = 0;
++  }
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_PWR_MGMT_1, (uint8_t *)&reg, sizeof(ICM_20948_PWR_MGMT_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_low_power(ICM_20948_Device_t *pdev, bool on)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  ICM_20948_PWR_MGMT_1_t reg;
++
++  ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_PWR_MGMT_1, (uint8_t *)&reg, sizeof(ICM_20948_PWR_MGMT_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  if (on)
++  {
++    reg.LP_EN = 1;
++  }
++  else
++  {
++    reg.LP_EN = 0;
++  }
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_PWR_MGMT_1, (uint8_t *)&reg, sizeof(ICM_20948_PWR_MGMT_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_set_clock_source(ICM_20948_Device_t *pdev, ICM_20948_PWR_MGMT_1_CLKSEL_e source)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  ICM_20948_PWR_MGMT_1_t reg;
++
++  ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_PWR_MGMT_1, (uint8_t *)&reg, sizeof(ICM_20948_PWR_MGMT_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  reg.CLKSEL = source;
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_PWR_MGMT_1, (uint8_t *)&reg, sizeof(ICM_20948_PWR_MGMT_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_get_who_am_i(ICM_20948_Device_t *pdev, uint8_t *whoami)
++{
++  if (whoami == NULL)
++  {
++    return ICM_20948_Stat_ParamErr;
++  }
++  ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++  return ICM_20948_execute_r(pdev, AGB0_REG_WHO_AM_I, whoami, 1);
++}
++
++ICM_20948_Status_e ICM_20948_check_id(ICM_20948_Device_t *pdev)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  uint8_t whoami = 0x00;
++  retval = ICM_20948_get_who_am_i(pdev, &whoami);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  if (whoami != ICM_20948_WHOAMI)
++  {
++    return ICM_20948_Stat_WrongID;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_data_ready(ICM_20948_Device_t *pdev)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  ICM_20948_INT_STATUS_1_t reg;
++  retval = ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_INT_STATUS_1, (uint8_t *)&reg, sizeof(ICM_20948_INT_STATUS_1_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  if (!reg.RAW_DATA_0_RDY_INT)
++  {
++    retval = ICM_20948_Stat_NoData;
++  }
++  return retval;
++}
++
++// Interrupt Configuration
++ICM_20948_Status_e ICM_20948_int_pin_cfg(ICM_20948_Device_t *pdev, ICM_20948_INT_PIN_CFG_t *write, ICM_20948_INT_PIN_CFG_t *read)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  retval = ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++  if (write != NULL)
++  { // write first, if available
++    retval = ICM_20948_execute_w(pdev, AGB0_REG_INT_PIN_CONFIG, (uint8_t *)write, sizeof(ICM_20948_INT_PIN_CFG_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++  }
++  if (read != NULL)
++  { // then read, to allow for verification
++    retval = ICM_20948_execute_r(pdev, AGB0_REG_INT_PIN_CONFIG, (uint8_t *)read, sizeof(ICM_20948_INT_PIN_CFG_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_int_enable(ICM_20948_Device_t *pdev, ICM_20948_INT_enable_t *write, ICM_20948_INT_enable_t *read)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_INT_ENABLE_t en_0;
++  ICM_20948_INT_ENABLE_1_t en_1;
++  ICM_20948_INT_ENABLE_2_t en_2;
++  ICM_20948_INT_ENABLE_3_t en_3;
++
++  retval = ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++
++  if (write != NULL)
++  { // If the write pointer is not NULL then write to the registers BEFORE reading
++    en_0.I2C_MST_INT_EN = write->I2C_MST_INT_EN;
++    en_0.DMP_INT1_EN = write->DMP_INT1_EN;
++    en_0.PLL_READY_EN = write->PLL_RDY_EN;
++    en_0.WOM_INT_EN = write->WOM_INT_EN;
++    en_0.reserved_0 = 0; // Clear RAM garbage
++    en_0.REG_WOF_EN = write->REG_WOF_EN;
++    en_1.RAW_DATA_0_RDY_EN = write->RAW_DATA_0_RDY_EN;
++    en_1.reserved_0 = 0; // Clear RAM garbage
++    en_2.individual.FIFO_OVERFLOW_EN_4 = write->FIFO_OVERFLOW_EN_4;
++    en_2.individual.FIFO_OVERFLOW_EN_3 = write->FIFO_OVERFLOW_EN_3;
++    en_2.individual.FIFO_OVERFLOW_EN_2 = write->FIFO_OVERFLOW_EN_2;
++    en_2.individual.FIFO_OVERFLOW_EN_1 = write->FIFO_OVERFLOW_EN_1;
++    en_2.individual.FIFO_OVERFLOW_EN_0 = write->FIFO_OVERFLOW_EN_0;
++    en_2.individual.reserved_0 = 0; // Clear RAM garbage
++    en_3.individual.FIFO_WM_EN_4 = write->FIFO_WM_EN_4;
++    en_3.individual.FIFO_WM_EN_3 = write->FIFO_WM_EN_3;
++    en_3.individual.FIFO_WM_EN_2 = write->FIFO_WM_EN_2;
++    en_3.individual.FIFO_WM_EN_1 = write->FIFO_WM_EN_1;
++    en_3.individual.FIFO_WM_EN_0 = write->FIFO_WM_EN_0;
++    en_3.individual.reserved_0 = 0; // Clear RAM garbage
++
++    retval = ICM_20948_execute_w(pdev, AGB0_REG_INT_ENABLE, (uint8_t *)&en_0, sizeof(ICM_20948_INT_ENABLE_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++    retval = ICM_20948_execute_w(pdev, AGB0_REG_INT_ENABLE_1, (uint8_t *)&en_1, sizeof(ICM_20948_INT_ENABLE_1_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++    retval = ICM_20948_execute_w(pdev, AGB0_REG_INT_ENABLE_2, (uint8_t *)&en_2, sizeof(ICM_20948_INT_ENABLE_2_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++    retval = ICM_20948_execute_w(pdev, AGB0_REG_INT_ENABLE_3, (uint8_t *)&en_3, sizeof(ICM_20948_INT_ENABLE_3_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++  }
++
++  if (read != NULL)
++  { // If read pointer is not NULL then read the registers (if write is not NULL then this should read back the results of write into read)
++    retval = ICM_20948_execute_r(pdev, AGB0_REG_INT_ENABLE, (uint8_t *)&en_0, sizeof(ICM_20948_INT_ENABLE_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++    retval = ICM_20948_execute_r(pdev, AGB0_REG_INT_ENABLE_1, (uint8_t *)&en_1, sizeof(ICM_20948_INT_ENABLE_1_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++    retval = ICM_20948_execute_r(pdev, AGB0_REG_INT_ENABLE_2, (uint8_t *)&en_2, sizeof(ICM_20948_INT_ENABLE_2_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++    retval = ICM_20948_execute_r(pdev, AGB0_REG_INT_ENABLE_3, (uint8_t *)&en_3, sizeof(ICM_20948_INT_ENABLE_3_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++
++    read->I2C_MST_INT_EN = en_0.I2C_MST_INT_EN;
++    read->DMP_INT1_EN = en_0.DMP_INT1_EN;
++    read->PLL_RDY_EN = en_0.PLL_READY_EN;
++    read->WOM_INT_EN = en_0.WOM_INT_EN;
++    read->REG_WOF_EN = en_0.REG_WOF_EN;
++    read->RAW_DATA_0_RDY_EN = en_1.RAW_DATA_0_RDY_EN;
++    read->FIFO_OVERFLOW_EN_4 = en_2.individual.FIFO_OVERFLOW_EN_4;
++    read->FIFO_OVERFLOW_EN_3 = en_2.individual.FIFO_OVERFLOW_EN_3;
++    read->FIFO_OVERFLOW_EN_2 = en_2.individual.FIFO_OVERFLOW_EN_2;
++    read->FIFO_OVERFLOW_EN_1 = en_2.individual.FIFO_OVERFLOW_EN_1;
++    read->FIFO_OVERFLOW_EN_0 = en_2.individual.FIFO_OVERFLOW_EN_0;
++    read->FIFO_WM_EN_4 = en_3.individual.FIFO_WM_EN_4;
++    read->FIFO_WM_EN_3 = en_3.individual.FIFO_WM_EN_3;
++    read->FIFO_WM_EN_2 = en_3.individual.FIFO_WM_EN_2;
++    read->FIFO_WM_EN_1 = en_3.individual.FIFO_WM_EN_1;
++    read->FIFO_WM_EN_0 = en_3.individual.FIFO_WM_EN_0;
++  }
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_wom_logic(ICM_20948_Device_t *pdev, ICM_20948_ACCEL_INTEL_CTRL_t *write, ICM_20948_ACCEL_INTEL_CTRL_t *read)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_ACCEL_INTEL_CTRL_t ctrl;
++
++  retval = ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++
++  if (write != NULL)
++  { // If the write pointer is not NULL then write to the registers BEFORE reading
++    ctrl.ACCEL_INTEL_EN = write->ACCEL_INTEL_EN;
++    ctrl.ACCEL_INTEL_MODE_INT = write->ACCEL_INTEL_MODE_INT;
++
++    retval = ICM_20948_execute_w(pdev, AGB2_REG_ACCEL_INTEL_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_ACCEL_INTEL_CTRL_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++  }
++
++  if (read != NULL)
++  { // If read pointer is not NULL then read the registers (if write is not NULL then this should read back the results of write into read)
++    retval = ICM_20948_execute_r(pdev, AGB2_REG_ACCEL_INTEL_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_ACCEL_INTEL_CTRL_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++
++    read->ACCEL_INTEL_EN = ctrl.ACCEL_INTEL_EN;
++    read->ACCEL_INTEL_MODE_INT = ctrl.ACCEL_INTEL_MODE_INT;
++  }
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_wom_threshold(ICM_20948_Device_t *pdev, ICM_20948_ACCEL_WOM_THR_t *write, ICM_20948_ACCEL_WOM_THR_t *read)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_ACCEL_WOM_THR_t thr;
++
++  retval = ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++
++  if (write != NULL)
++  { // If the write pointer is not NULL then write to the registers BEFORE reading
++    thr.WOM_THRESHOLD = write->WOM_THRESHOLD;
++
++    retval = ICM_20948_execute_w(pdev, AGB2_REG_ACCEL_WOM_THR, (uint8_t *)&thr, sizeof(ICM_20948_ACCEL_WOM_THR_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++  }
++
++  if (read != NULL)
++  { // If read pointer is not NULL then read the registers (if write is not NULL then this should read back the results of write into read)
++    retval = ICM_20948_execute_r(pdev, AGB2_REG_ACCEL_WOM_THR, (uint8_t *)&thr, sizeof(ICM_20948_ACCEL_WOM_THR_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++
++    read->WOM_THRESHOLD = thr.WOM_THRESHOLD;
++  }
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_set_sample_mode(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, ICM_20948_LP_CONFIG_CYCLE_e mode)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  ICM_20948_LP_CONFIG_t reg;
++
++  if (!(sensors & (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr | ICM_20948_Internal_Mst)))
++  {
++    return ICM_20948_Stat_SensorNotSupported;
++  }
++
++  retval = ICM_20948_set_bank(pdev, 0); // Must be in the right bank
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_LP_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_LP_CONFIG_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  if (sensors & ICM_20948_Internal_Acc)
++  {
++    reg.ACCEL_CYCLE = mode;
++  } // Set all desired sensors to this setting
++  if (sensors & ICM_20948_Internal_Gyr)
++  {
++    reg.GYRO_CYCLE = mode;
++  }
++  if (sensors & ICM_20948_Internal_Mst)
++  {
++    reg.I2C_MST_CYCLE = mode;
++  }
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_LP_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_LP_CONFIG_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  // Check the data was written correctly
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_LP_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_LP_CONFIG_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  if (sensors & ICM_20948_Internal_Acc)
++  {
++    if (reg.ACCEL_CYCLE != mode) retval = ICM_20948_Stat_Err;
++  }
++  if (sensors & ICM_20948_Internal_Gyr)
++  {
++    if (reg.GYRO_CYCLE != mode) retval = ICM_20948_Stat_Err;
++  }
++  if (sensors & ICM_20948_Internal_Mst)
++  {
++    if (reg.I2C_MST_CYCLE != mode) retval = ICM_20948_Stat_Err;
++  }
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_set_full_scale(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, ICM_20948_fss_t fss)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  if (!(sensors & (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr)))
++  {
++    return ICM_20948_Stat_SensorNotSupported;
++  }
++
++  if (sensors & ICM_20948_Internal_Acc)
++  {
++    ICM_20948_ACCEL_CONFIG_t reg;
++    retval |= ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    reg.ACCEL_FS_SEL = fss.a;
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    // Check the data was written correctly
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    if (reg.ACCEL_FS_SEL != fss.a) retval |= ICM_20948_Stat_Err;
++  }
++  if (sensors & ICM_20948_Internal_Gyr)
++  {
++    ICM_20948_GYRO_CONFIG_1_t reg;
++    retval |= ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    reg.GYRO_FS_SEL = fss.g;
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    // Check the data was written correctly
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    if (reg.GYRO_FS_SEL != fss.g) retval |= ICM_20948_Stat_Err;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_set_dlpf_cfg(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, ICM_20948_dlpcfg_t cfg)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  if (!(sensors & (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr)))
++  {
++    return ICM_20948_Stat_SensorNotSupported;
++  }
++
++  if (sensors & ICM_20948_Internal_Acc)
++  {
++    ICM_20948_ACCEL_CONFIG_t reg;
++    retval |= ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    reg.ACCEL_DLPFCFG = cfg.a;
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    // Check the data was written correctly
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    if (reg.ACCEL_DLPFCFG != cfg.a) retval |= ICM_20948_Stat_Err;
++  }
++  if (sensors & ICM_20948_Internal_Gyr)
++  {
++    ICM_20948_GYRO_CONFIG_1_t reg;
++    retval |= ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    reg.GYRO_DLPFCFG = cfg.g;
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    // Check the data was written correctly
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    if (reg.GYRO_DLPFCFG != cfg.g) retval |= ICM_20948_Stat_Err;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_enable_dlpf(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, bool enable)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  if (!(sensors & (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr)))
++  {
++    return ICM_20948_Stat_SensorNotSupported;
++  }
++
++  if (sensors & ICM_20948_Internal_Acc)
++  {
++    ICM_20948_ACCEL_CONFIG_t reg;
++    retval |= ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    if (enable)
++    {
++      reg.ACCEL_FCHOICE = 1;
++    }
++    else
++    {
++      reg.ACCEL_FCHOICE = 0;
++    }
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    // Check the data was written correctly
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_ACCEL_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_ACCEL_CONFIG_t));
++    if (enable)
++    {
++      if (reg.ACCEL_FCHOICE != 1) retval |= ICM_20948_Stat_Err;
++    }
++    else
++    {
++      if (reg.ACCEL_FCHOICE != 0) retval |= ICM_20948_Stat_Err;
++    }
++  }
++  if (sensors & ICM_20948_Internal_Gyr)
++  {
++    ICM_20948_GYRO_CONFIG_1_t reg;
++    retval |= ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    if (enable)
++    {
++      reg.GYRO_FCHOICE = 1;
++    }
++    else
++    {
++      reg.GYRO_FCHOICE = 0;
++    }
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    // Check the data was written correctly
++    retval |= ICM_20948_execute_r(pdev, AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&reg, sizeof(ICM_20948_GYRO_CONFIG_1_t));
++    if (enable)
++    {
++      if (reg.GYRO_FCHOICE != 1) retval |= ICM_20948_Stat_Err;
++    }
++    else
++    {
++      if (reg.GYRO_FCHOICE != 0) retval |= ICM_20948_Stat_Err;
++    }
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_set_sample_rate(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, ICM_20948_smplrt_t smplrt)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  if (!(sensors & (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr)))
++  {
++    return ICM_20948_Stat_SensorNotSupported;
++  }
++
++  if (sensors & ICM_20948_Internal_Acc)
++  {
++    retval |= ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++    uint8_t div1 = (smplrt.a >> 8); // Thank you @yanivamichy #109
++    uint8_t div2 = (smplrt.a & 0xFF);
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_ACCEL_SMPLRT_DIV_1, &div1, 1);
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_ACCEL_SMPLRT_DIV_2, &div2, 1);
++  }
++  if (sensors & ICM_20948_Internal_Gyr)
++  {
++    retval |= ICM_20948_set_bank(pdev, 2); // Must be in the right bank
++    uint8_t div = (smplrt.g);
++    retval |= ICM_20948_execute_w(pdev, AGB2_REG_GYRO_SMPLRT_DIV, &div, 1);
++  }
++  return retval;
++}
++
++// Interface Things
++ICM_20948_Status_e ICM_20948_i2c_master_passthrough(ICM_20948_Device_t *pdev, bool passthrough)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_INT_PIN_CFG_t reg;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_INT_PIN_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_INT_PIN_CFG_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  reg.BYPASS_EN = passthrough;
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_INT_PIN_CONFIG, (uint8_t *)&reg, sizeof(ICM_20948_INT_PIN_CFG_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_i2c_master_enable(ICM_20948_Device_t *pdev, bool enable)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  // Disable BYPASS_EN
++  retval = ICM_20948_i2c_master_passthrough(pdev, false);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  ICM_20948_I2C_MST_CTRL_t ctrl;
++  retval = ICM_20948_set_bank(pdev, 3);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  retval = ICM_20948_execute_r(pdev, AGB3_REG_I2C_MST_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_I2C_MST_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  ctrl.I2C_MST_CLK = 0x07; // corresponds to 345.6 kHz, good for up to 400 kHz
++  ctrl.I2C_MST_P_NSR = 1;
++  retval = ICM_20948_execute_w(pdev, AGB3_REG_I2C_MST_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_I2C_MST_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  ICM_20948_USER_CTRL_t reg;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&reg, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  if (enable)
++  {
++    reg.I2C_MST_EN = 1;
++  }
++  else
++  {
++    reg.I2C_MST_EN = 0;
++  }
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&reg, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_i2c_master_reset(ICM_20948_Device_t *pdev)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_USER_CTRL_t ctrl;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  ctrl.I2C_MST_RST = 1; //Reset!
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_i2c_controller_configure_peripheral(ICM_20948_Device_t *pdev, uint8_t peripheral, uint8_t addr, uint8_t reg, uint8_t len, bool Rw, bool enable, bool data_only, bool grp, bool swap, uint8_t dataOut)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  uint8_t periph_addr_reg;
++  uint8_t periph_reg_reg;
++  uint8_t periph_ctrl_reg;
++  uint8_t periph_do_reg;
++
++  switch (peripheral)
++  {
++  case 0:
++    periph_addr_reg = AGB3_REG_I2C_PERIPH0_ADDR;
++    periph_reg_reg = AGB3_REG_I2C_PERIPH0_REG;
++    periph_ctrl_reg = AGB3_REG_I2C_PERIPH0_CTRL;
++    periph_do_reg = AGB3_REG_I2C_PERIPH0_DO;
++    break;
++  case 1:
++    periph_addr_reg = AGB3_REG_I2C_PERIPH1_ADDR;
++    periph_reg_reg = AGB3_REG_I2C_PERIPH1_REG;
++    periph_ctrl_reg = AGB3_REG_I2C_PERIPH1_CTRL;
++    periph_do_reg = AGB3_REG_I2C_PERIPH1_DO;
++    break;
++  case 2:
++    periph_addr_reg = AGB3_REG_I2C_PERIPH2_ADDR;
++    periph_reg_reg = AGB3_REG_I2C_PERIPH2_REG;
++    periph_ctrl_reg = AGB3_REG_I2C_PERIPH2_CTRL;
++    periph_do_reg = AGB3_REG_I2C_PERIPH2_DO;
++    break;
++  case 3:
++    periph_addr_reg = AGB3_REG_I2C_PERIPH3_ADDR;
++    periph_reg_reg = AGB3_REG_I2C_PERIPH3_REG;
++    periph_ctrl_reg = AGB3_REG_I2C_PERIPH3_CTRL;
++    periph_do_reg = AGB3_REG_I2C_PERIPH3_DO;
++    break;
++  default:
++    return ICM_20948_Stat_ParamErr;
++  }
++
++  retval = ICM_20948_set_bank(pdev, 3);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  // Set the peripheral address and the Rw flag
++  ICM_20948_I2C_PERIPHX_ADDR_t address;
++  address.ID = addr;
++  if (Rw)
++  {
++    address.RNW = 1;
++  }
++  else
++  {
++    address.RNW = 0; // Make sure bit is clear (just in case there is any garbage in that RAM location)
++  }
++  retval = ICM_20948_execute_w(pdev, periph_addr_reg, (uint8_t *)&address, sizeof(ICM_20948_I2C_PERIPHX_ADDR_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  // If we are setting up a write, configure the Data Out register too
++  if (!Rw)
++  {
++    ICM_20948_I2C_PERIPHX_DO_t dataOutByte;
++    dataOutByte.DO = dataOut;
++    retval = ICM_20948_execute_w(pdev, periph_do_reg, (uint8_t *)&dataOutByte, sizeof(ICM_20948_I2C_PERIPHX_DO_t));
++    if (retval != ICM_20948_Stat_Ok)
++    {
++      return retval;
++    }
++  }
++
++  // Set the peripheral sub-address (register address)
++  ICM_20948_I2C_PERIPHX_REG_t subaddress;
++  subaddress.REG = reg;
++  retval = ICM_20948_execute_w(pdev, periph_reg_reg, (uint8_t *)&subaddress, sizeof(ICM_20948_I2C_PERIPHX_REG_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  // Set up the control info
++  ICM_20948_I2C_PERIPHX_CTRL_t ctrl;
++  ctrl.LENG = len;
++  ctrl.EN = enable;
++  ctrl.REG_DIS = data_only;
++  ctrl.GRP = grp;
++  ctrl.BYTE_SW = swap;
++  retval = ICM_20948_execute_w(pdev, periph_ctrl_reg, (uint8_t *)&ctrl, sizeof(ICM_20948_I2C_PERIPHX_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  return retval;
++}
++
++// Higher Level
++ICM_20948_Status_e ICM_20948_get_agmt(ICM_20948_Device_t *pdev, ICM_20948_AGMT_t *pagmt)
++{
++  if (pagmt == NULL)
++  {
++    return ICM_20948_Stat_ParamErr;
++  }
++
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++  const uint8_t numbytes = 14 + 9; //Read Accel, gyro, temp, and 9 bytes of mag
++  uint8_t buff[numbytes];
++
++  // Get readings
++  retval |= ICM_20948_set_bank(pdev, 0);
++  retval |= ICM_20948_execute_r(pdev, (uint8_t)AGB0_REG_ACCEL_XOUT_H, buff, numbytes);
++
++  pagmt->acc.axes.x = ((buff[0] << 8) | (buff[1] & 0xFF));
++  pagmt->acc.axes.y = ((buff[2] << 8) | (buff[3] & 0xFF));
++  pagmt->acc.axes.z = ((buff[4] << 8) | (buff[5] & 0xFF));
++
++  pagmt->gyr.axes.x = ((buff[6] << 8) | (buff[7] & 0xFF));
++  pagmt->gyr.axes.y = ((buff[8] << 8) | (buff[9] & 0xFF));
++  pagmt->gyr.axes.z = ((buff[10] << 8) | (buff[11] & 0xFF));
++
++  pagmt->tmp.val = ((buff[12] << 8) | (buff[13] & 0xFF));
++
++  pagmt->magStat1 = buff[14];
++  pagmt->mag.axes.x = ((buff[16] << 8) | (buff[15] & 0xFF)); //Mag data is read little endian
++  pagmt->mag.axes.y = ((buff[18] << 8) | (buff[17] & 0xFF));
++  pagmt->mag.axes.z = ((buff[20] << 8) | (buff[19] & 0xFF));
++  pagmt->magStat2 = buff[22];
++
++  // Get settings to be able to compute scaled values
++  retval |= ICM_20948_set_bank(pdev, 2);
++  ICM_20948_ACCEL_CONFIG_t acfg;
++  retval |= ICM_20948_execute_r(pdev, (uint8_t)AGB2_REG_ACCEL_CONFIG, (uint8_t *)&acfg, 1 * sizeof(acfg));
++  pagmt->fss.a = acfg.ACCEL_FS_SEL; // Worth noting that without explicitly setting the FS range of the accelerometer it was showing the register value for +/- 2g but the reported values were actually scaled to the +/- 16g range
++                                    // Wait a minute... now it seems like this problem actually comes from the digital low-pass filter. When enabled the value is 1/8 what it should be...
++  retval |= ICM_20948_set_bank(pdev, 2);
++  ICM_20948_GYRO_CONFIG_1_t gcfg1;
++  retval |= ICM_20948_execute_r(pdev, (uint8_t)AGB2_REG_GYRO_CONFIG_1, (uint8_t *)&gcfg1, 1 * sizeof(gcfg1));
++  pagmt->fss.g = gcfg1.GYRO_FS_SEL;
++  ICM_20948_ACCEL_CONFIG_2_t acfg2;
++  retval |= ICM_20948_execute_r(pdev, (uint8_t)AGB2_REG_ACCEL_CONFIG_2, (uint8_t *)&acfg2, 1 * sizeof(acfg2));
++
++  return retval;
++}
++
++// FIFO
++
++ICM_20948_Status_e ICM_20948_enable_FIFO(ICM_20948_Device_t *pdev, bool enable)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_USER_CTRL_t ctrl;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  if (enable)
++    ctrl.FIFO_EN = 1;
++  else
++    ctrl.FIFO_EN = 0;
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_reset_FIFO(ICM_20948_Device_t *pdev)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_FIFO_RST_t ctrl;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_FIFO_RST, (uint8_t *)&ctrl, sizeof(ICM_20948_FIFO_RST_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  ctrl.FIFO_RESET = 0x1F; // Datasheet says "FIFO_RESET[4:0]"
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_FIFO_RST, (uint8_t *)&ctrl, sizeof(ICM_20948_FIFO_RST_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  //delay ???
++
++  ctrl.FIFO_RESET = 0x1E; // The InvenSense Nucleo examples write 0x1F followed by 0x1E
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_FIFO_RST, (uint8_t *)&ctrl, sizeof(ICM_20948_FIFO_RST_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_set_FIFO_mode(ICM_20948_Device_t *pdev, bool snapshot)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_FIFO_MODE_t ctrl;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_FIFO_MODE, (uint8_t *)&ctrl, sizeof(ICM_20948_FIFO_MODE_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  if (snapshot)
++    ctrl.FIFO_MODE = 0x1F; // Datasheet says "FIFO_MODE[4:0]"
++  else
++    ctrl.FIFO_MODE = 0;
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_FIFO_MODE, (uint8_t *)&ctrl, sizeof(ICM_20948_FIFO_MODE_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_get_FIFO_count(ICM_20948_Device_t *pdev, uint16_t *count)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_FIFO_COUNTH_t ctrlh;
++  ICM_20948_FIFO_COUNTL_t ctrll;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_FIFO_COUNT_H, (uint8_t *)&ctrlh, sizeof(ICM_20948_FIFO_COUNTH_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  ctrlh.FIFO_COUNTH &= 0x1F; // Datasheet says "FIFO_CNT[12:8]"
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_FIFO_COUNT_L, (uint8_t *)&ctrll, sizeof(ICM_20948_FIFO_COUNTL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  *count = (((uint16_t)ctrlh.FIFO_COUNTH) << 8) | (uint16_t)ctrll.FIFO_COUNTL;
++
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_read_FIFO(ICM_20948_Device_t *pdev, uint8_t *data, uint8_t len)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_FIFO_R_W, data, len);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  return retval;
++}
++
++// DMP
++
++ICM_20948_Status_e ICM_20948_enable_DMP(ICM_20948_Device_t *pdev, bool enable)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_USER_CTRL_t ctrl;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  if (enable)
++    ctrl.DMP_EN = 1;
++  else
++    ctrl.DMP_EN = 0;
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_reset_DMP(ICM_20948_Device_t *pdev)
++{
++  ICM_20948_Status_e retval = ICM_20948_Stat_Ok;
++
++  ICM_20948_USER_CTRL_t ctrl;
++  retval = ICM_20948_set_bank(pdev, 0);
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  retval = ICM_20948_execute_r(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++
++  ctrl.DMP_RST = 1;
++
++  retval = ICM_20948_execute_w(pdev, AGB0_REG_USER_CTRL, (uint8_t *)&ctrl, sizeof(ICM_20948_USER_CTRL_t));
++  if (retval != ICM_20948_Stat_Ok)
++  {
++    return retval;
++  }
++  return retval;
++}
++
++ICM_20948_Status_e ICM_20948_firmware_load(ICM_20948_Device_t *pdev)
++{
++#if defined(ICM_20948_USE_DMP)
++  return (inv_icm20948_firmware_load(pdev, dmp3_image, sizeof(dmp3_image), DMP_LOAD_START));
++#else
++  return ICM_20948_Stat_DMPNotSupported;
++#endif
++}
++
++/** @brief Loads the DMP firmware from SRAM
++* @param[in] data  pointer where the image
++* @param[in] size  size if the image
++* @param[in] load_addr  address to loading the image
++* @return 0 in case of success, -1 for any error
++*/
++ICM_20948_Status_e inv_icm20948_firmware_load(ICM_20948_Device_t *pdev, const unsigned char *data_start, unsigned short size_start, unsigned short load_addr)
++{
++  int write_size;
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++  unsigned short memaddr;
++  const unsigned char *data;
++  unsigned short size;
++  unsigned char data_cmp[INV_MAX_SERIAL_READ];
++  int flag = 0;
++
++  if (pdev->_dmp_firmware_available == false)
++    return ICM_20948_Stat_DMPNotSupported;
++
++  if (pdev->_firmware_loaded)
++    return ICM_20948_Stat_Ok; // Bail with no error if firmware is already loaded
++
++  result = ICM_20948_sleep(pdev, false); // Make sure chip is awake
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  result = ICM_20948_low_power(pdev, false); // Make sure chip is not in low power state
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  // Write DMP memory
++
++  data = data_start;
++  size = size_start;
++  memaddr = load_addr;
++  #ifdef ICM_20948_USE_PROGMEM_FOR_DMP
++  unsigned char data_not_pg[INV_MAX_SERIAL_READ]; // Suggested by @HyperKokichi in Issue #63
++  #endif
++  while (size > 0)
++  {
++    //write_size = min(size, INV_MAX_SERIAL_WRITE); // Write in chunks of INV_MAX_SERIAL_WRITE
++    if (size <= INV_MAX_SERIAL_WRITE) // Write in chunks of INV_MAX_SERIAL_WRITE
++      write_size = size;
++    else
++      write_size = INV_MAX_SERIAL_WRITE;
++    if ((memaddr & 0xff) + write_size > 0x100)
++    {
++      // Moved across a bank
++      write_size = (memaddr & 0xff) + write_size - 0x100;
++    }
++#ifdef ICM_20948_USE_PROGMEM_FOR_DMP
++    memcpy_P(data_not_pg, data, write_size);  // Suggested by @HyperKokichi in Issue #63
++    result = inv_icm20948_write_mems(pdev, memaddr, write_size, (unsigned char *)data_not_pg);
++#else
++    result = inv_icm20948_write_mems(pdev, memaddr, write_size, (unsigned char *)data);
++#endif
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    data += write_size;
++    size -= write_size;
++    memaddr += write_size;
++  }
++
++  // Verify DMP memory
++
++  data = data_start;
++  size = size_start;
++  memaddr = load_addr;
++  while (size > 0)
++  {
++    //write_size = min(size, INV_MAX_SERIAL_READ); // Read in chunks of INV_MAX_SERIAL_READ
++    if (size <= INV_MAX_SERIAL_READ) // Read in chunks of INV_MAX_SERIAL_READ
++      write_size = size;
++    else
++      write_size = INV_MAX_SERIAL_READ;
++    if ((memaddr & 0xff) + write_size > 0x100)
++    {
++      // Moved across a bank
++      write_size = (memaddr & 0xff) + write_size - 0x100;
++    }
++    result = inv_icm20948_read_mems(pdev, memaddr, write_size, data_cmp);
++    if (result != ICM_20948_Stat_Ok)
++      flag++;                               // Error, DMP not written correctly
++#ifdef ICM_20948_USE_PROGMEM_FOR_DMP
++    memcpy_P(data_not_pg, data, write_size);  // Suggested by @HyperKokichi in Issue #63
++    if (memcmp(data_cmp, data_not_pg, write_size))
++#else
++    if (memcmp(data_cmp, data, write_size)) // Compare the data
++#endif
++      return ICM_20948_Stat_DMPVerifyFail;
++    data += write_size;
++    size -= write_size;
++    memaddr += write_size;
++  }
++
++  //Enable LP_EN since we disabled it at begining of this function.
++  result = ICM_20948_low_power(pdev, true); // Put chip into low power state
++  if (result != ICM_20948_Stat_Ok)
++    return result;
++
++  if (!flag)
++  {
++    //Serial.println("DMP Firmware was updated successfully..");
++    pdev->_firmware_loaded = true;
++  }
++
++  return result;
++}
++
++ICM_20948_Status_e ICM_20948_set_dmp_start_address(ICM_20948_Device_t *pdev, unsigned short address)
++{
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++
++  if (pdev->_dmp_firmware_available == false)
++    return ICM_20948_Stat_DMPNotSupported;
++
++  unsigned char start_address[2];
++
++  start_address[0] = (unsigned char)(address >> 8);
++  start_address[1] = (unsigned char)(address & 0xff);
++
++  // result = ICM_20948_sleep(pdev, false); // Make sure chip is awake
++  // if (result != ICM_20948_Stat_Ok)
++  // {
++  // 		return result;
++  // }
++  //
++  // result = ICM_20948_low_power(pdev, false); // Make sure chip is not in low power state
++  // if (result != ICM_20948_Stat_Ok)
++  // {
++  // 		return result;
++  // }
++
++  result = ICM_20948_set_bank(pdev, 2); // Set bank 2
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  // Write the sensor control bits into memory address AGB2_REG_PRGM_START_ADDRH
++  result = ICM_20948_execute_w(pdev, AGB2_REG_PRGM_START_ADDRH, (uint8_t *)start_address, 2);
++
++  return result;
++}
++
++/**
++*  @brief       Write data to a register in DMP memory
++*  @param[in]   DMP memory address
++*  @param[in]   number of byte to be written
++*  @param[out]  output data from the register
++*  @return     0 if successful.
++*/
++ICM_20948_Status_e inv_icm20948_write_mems(ICM_20948_Device_t *pdev, unsigned short reg, unsigned int length, const unsigned char *data)
++{
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++  unsigned int bytesWritten = 0;
++  unsigned int thisLen;
++  unsigned char lBankSelected;
++  unsigned char lStartAddrSelected;
++
++  if (!data)
++  {
++    return ICM_20948_Stat_NoData;
++  }
++
++  result = ICM_20948_set_bank(pdev, 0); // Set bank 0
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  lBankSelected = (reg >> 8);
++
++  if (lBankSelected != pdev->_last_mems_bank)
++  {
++    pdev->_last_mems_bank = lBankSelected;
++    result = ICM_20948_execute_w(pdev, AGB0_REG_MEM_BANK_SEL, &lBankSelected, 1);
++    if (result != ICM_20948_Stat_Ok)
++    {
++      return result;
++    }
++  }
++
++  while (bytesWritten < length)
++  {
++    lStartAddrSelected = (reg & 0xff);
++
++    /* Sets the starting read or write address for the selected memory, inside of the selected page (see MEM_SEL Register).
++           Contents are changed after read or write of the selected memory.
++           This register must be written prior to each access to initialize the register to the proper starting address.
++           The address will auto increment during burst transactions.  Two consecutive bursts without re-initializing the start address would skip one address. */
++
++    result = ICM_20948_execute_w(pdev, AGB0_REG_MEM_START_ADDR, &lStartAddrSelected, 1);
++    if (result != ICM_20948_Stat_Ok)
++    {
++      return result;
++    }
++
++    if (length - bytesWritten <= INV_MAX_SERIAL_WRITE)
++      thisLen = length - bytesWritten;
++    else
++      thisLen = INV_MAX_SERIAL_WRITE;
++
++    /* Write data */
++
++    result = ICM_20948_execute_w(pdev, AGB0_REG_MEM_R_W, (uint8_t *)&data[bytesWritten], thisLen);
++    if (result != ICM_20948_Stat_Ok)
++    {
++      return result;
++    }
++
++    bytesWritten += thisLen;
++    reg += thisLen;
++  }
++
++  return result;
++}
++
++/**
++*  @brief      Read data from a register in DMP memory
++*  @param[in]  DMP memory address
++*  @param[in]  number of byte to be read
++*  @param[in]  input data from the register
++*  @return     0 if successful.
++*/
++ICM_20948_Status_e inv_icm20948_read_mems(ICM_20948_Device_t *pdev, unsigned short reg, unsigned int length, unsigned char *data)
++{
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++  unsigned int bytesRead = 0;
++  unsigned int thisLen;
++  unsigned char lBankSelected;
++  unsigned char lStartAddrSelected;
++
++  if (!data)
++  {
++    return ICM_20948_Stat_NoData;
++  }
++
++  result = ICM_20948_set_bank(pdev, 0); // Set bank 0
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  lBankSelected = (reg >> 8);
++
++  if (lBankSelected != pdev->_last_mems_bank)
++  {
++    pdev->_last_mems_bank = lBankSelected;
++    result = ICM_20948_execute_w(pdev, AGB0_REG_MEM_BANK_SEL, &lBankSelected, 1);
++    if (result != ICM_20948_Stat_Ok)
++    {
++      return result;
++    }
++  }
++
++  while (bytesRead < length)
++  {
++    lStartAddrSelected = (reg & 0xff);
++
++    /* Sets the starting read or write address for the selected memory, inside of the selected page (see MEM_SEL Register).
++		   Contents are changed after read or write of the selected memory.
++		   This register must be written prior to each access to initialize the register to the proper starting address.
++		   The address will auto increment during burst transactions.  Two consecutive bursts without re-initializing the start address would skip one address. */
++
++    result = ICM_20948_execute_w(pdev, AGB0_REG_MEM_START_ADDR, &lStartAddrSelected, 1);
++    if (result != ICM_20948_Stat_Ok)
++    {
++      return result;
++    }
++
++    if (length - bytesRead <= INV_MAX_SERIAL_READ)
++      thisLen = length - bytesRead;
++    else
++      thisLen = INV_MAX_SERIAL_READ;
++
++    /* Read data */
++
++    result = ICM_20948_execute_r(pdev, AGB0_REG_MEM_R_W, &data[bytesRead], thisLen);
++    if (result != ICM_20948_Stat_Ok)
++    {
++      return result;
++    }
++
++    bytesRead += thisLen;
++    reg += thisLen;
++  }
++
++  return result;
++}
++
++ICM_20948_Status_e inv_icm20948_set_dmp_sensor_period(ICM_20948_Device_t *pdev, enum DMP_ODR_Registers odr_reg, uint16_t interval)
++{
++  // Set the ODR registers and clear the ODR counter
++
++  // In order to set an ODR for a given sensor data, write 2-byte value to DMP using key defined above for a particular sensor.
++  // Setting value can be calculated as follows:
++  // Value = (DMP running rate (225Hz) / ODR ) - 1
++  // E.g. For a 25Hz ODR rate, value= (225/25) -1 = 8.
++
++  // During run-time, if an ODR is changed, the corresponding rate counter must be reset.
++  // To reset, write 2-byte {0,0} to DMP using keys below for a particular sensor:
++
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++  ICM_20948_Status_e result2 = ICM_20948_Stat_Ok;
++
++  if (pdev->_dmp_firmware_available == false)
++    return ICM_20948_Stat_DMPNotSupported;
++
++  unsigned char odr_reg_val[2];
++  odr_reg_val[0] = (unsigned char)(interval >> 8);
++  odr_reg_val[1] = (unsigned char)(interval & 0xff);
++
++  unsigned char odr_count_zero[2] = {0x00, 0x00};
++
++  result = ICM_20948_sleep(pdev, false); // Make sure chip is awake
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  result = ICM_20948_low_power(pdev, false); // Make sure chip is not in low power state
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  switch (odr_reg)
++  {
++  case DMP_ODR_Reg_Cpass_Calibr:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_CPASS_CALIBR, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_CPASS_CALIBR, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_Gyro_Calibr:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_GYRO_CALIBR, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_GYRO_CALIBR, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_Pressure:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_PRESSURE, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_PRESSURE, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_Geomag:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_GEOMAG, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_GEOMAG, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_PQuat6:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_PQUAT6, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_PQUAT6, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_Quat9:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_QUAT9, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_QUAT9, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_Quat6:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_QUAT6, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_QUAT6, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_ALS:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_ALS, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_ALS, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_Cpass:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_CPASS, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_CPASS, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_Gyro:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_GYRO, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_GYRO, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  case DMP_ODR_Reg_Accel:
++  {
++    result = inv_icm20948_write_mems(pdev, ODR_ACCEL, 2, (const unsigned char *)&odr_reg_val);
++    result2 = inv_icm20948_write_mems(pdev, ODR_CNTR_ACCEL, 2, (const unsigned char *)&odr_count_zero);
++  }
++  break;
++  default:
++    result = ICM_20948_Stat_InvalDMPRegister;
++    break;
++  }
++
++  result = ICM_20948_low_power(pdev, true); // Put chip into low power state
++  if (result != ICM_20948_Stat_Ok)
++    return result;
++
++  if (result2 > result)
++    result = result2; // Return the highest error
++
++  return result;
++}
++
++ICM_20948_Status_e inv_icm20948_enable_dmp_sensor(ICM_20948_Device_t *pdev, enum inv_icm20948_sensor sensor, int state)
++{
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++
++  uint16_t inv_event_control = 0; // Use this to store the value for MOTION_EVENT_CTL
++  uint16_t data_rdy_status = 0;   // Use this to store the value for DATA_RDY_STATUS
++
++  if (pdev->_dmp_firmware_available == false)
++    return ICM_20948_Stat_DMPNotSupported; // Bail if DMP is not supported
++
++  uint8_t androidSensor = sensor_type_2_android_sensor(sensor); // Convert sensor from enum inv_icm20948_sensor to Android numbering
++
++  if (androidSensor >= ANDROID_SENSOR_NUM_MAX)
++    return ICM_20948_Stat_SensorNotSupported; // Bail if the sensor is not supported (TO DO: Support B2S etc)
++
++  // Convert the Android sensor into a bit mask for DATA_OUT_CTL1
++  uint16_t delta = inv_androidSensor_to_control_bits[androidSensor];
++  if (delta == 0xFFFF)
++    return ICM_20948_Stat_SensorNotSupported; // Bail if the sensor is not supported
++
++  // Convert the Android sensor number into a bitmask and set or clear that bit in _enabled_Android_0 / _enabled_Android_1
++  unsigned long androidSensorAsBitMask;
++  if (androidSensor < 32) // Sensors 0-31
++  {
++    androidSensorAsBitMask = 1L << androidSensor;
++    if (state == 0) // Should we disable the sensor?
++    {
++      pdev->_enabled_Android_0 &= ~androidSensorAsBitMask; // Clear the bit to disable the sensor
++    }
++    else
++    {
++      pdev->_enabled_Android_0 |= androidSensorAsBitMask; // Set the bit to enable the sensor
++    }
++  }
++  else // Sensors 32-
++  {
++    androidSensorAsBitMask = 1L << (androidSensor - 32);
++    if (state == 0) // Should we disable the sensor?
++    {
++      pdev->_enabled_Android_1 &= ~androidSensorAsBitMask; // Clear the bit to disable the sensor
++    }
++    else
++    {
++      pdev->_enabled_Android_1 |= androidSensorAsBitMask; // Set the bit to enable the sensor
++    }
++  }
++
++  // Now we know androidSensor is valid, reconstruct the value for DATA_OUT_CTL1 from _enabled_Android_0 and _enabled_Android_0
++  delta = 0; // Clear delta
++  for (int i = 0; i < 32; i++)
++  {
++    androidSensorAsBitMask = 1L << i;
++    if ((pdev->_enabled_Android_0 & androidSensorAsBitMask) > 0) // Check if the Android sensor (0-31) is enabled
++    {
++      delta |= inv_androidSensor_to_control_bits[i]; // If it is, or the required bits into delta
++    }
++    if ((pdev->_enabled_Android_1 & androidSensorAsBitMask) > 0) // Check if the Android sensor (32-) is enabled
++    {
++      delta |= inv_androidSensor_to_control_bits[i + 32]; // If it is, or the required bits into delta
++    }
++    // Also check which bits need to be set in the Data Ready Status and Motion Event Control registers
++    // Compare to INV_NEEDS_ACCEL_MASK, INV_NEEDS_GYRO_MASK and INV_NEEDS_COMPASS_MASK
++    // See issue #150 - thank you @dobodu
++    if (((pdev->_enabled_Android_0 & androidSensorAsBitMask & INV_NEEDS_ACCEL_MASK) > 0)
++    || ((pdev->_enabled_Android_1 & androidSensorAsBitMask & INV_NEEDS_ACCEL_MASK1) > 0))
++    {
++      data_rdy_status |= DMP_Data_ready_Accel;
++      inv_event_control |= DMP_Motion_Event_Control_Accel_Calibr;
++    }
++    if (((pdev->_enabled_Android_0 & androidSensorAsBitMask & INV_NEEDS_GYRO_MASK) > 0)
++    || ((pdev->_enabled_Android_1 & androidSensorAsBitMask & INV_NEEDS_GYRO_MASK1) > 0))
++    {
++      data_rdy_status |= DMP_Data_ready_Gyro;
++      inv_event_control |= DMP_Motion_Event_Control_Gyro_Calibr;
++    }
++    if (((pdev->_enabled_Android_0 & androidSensorAsBitMask & INV_NEEDS_COMPASS_MASK) > 0)
++    || ((pdev->_enabled_Android_1 & androidSensorAsBitMask & INV_NEEDS_COMPASS_MASK1) > 0))
++    {
++      data_rdy_status |= DMP_Data_ready_Secondary_Compass;
++      inv_event_control |= DMP_Motion_Event_Control_Compass_Calibr;
++    }
++  }
++
++  result = ICM_20948_sleep(pdev, false); // Make sure chip is awake
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  result = ICM_20948_low_power(pdev, false); // Make sure chip is not in low power state
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  // Check if Accel, Gyro/Gyro_Calibr or Compass_Calibr/Quat9/GeoMag/Compass are to be enabled. If they are then we need to request the accuracy data via header2.
++  uint16_t delta2 = 0;
++  if ((delta & DMP_Data_Output_Control_1_Accel) > 0)
++  {
++    delta2 |= DMP_Data_Output_Control_2_Accel_Accuracy;
++  }
++  if (((delta & DMP_Data_Output_Control_1_Gyro_Calibr) > 0) || ((delta & DMP_Data_Output_Control_1_Gyro) > 0))
++  {
++    delta2 |= DMP_Data_Output_Control_2_Gyro_Accuracy;
++  }
++  if (((delta & DMP_Data_Output_Control_1_Compass_Calibr) > 0) || ((delta & DMP_Data_Output_Control_1_Compass) > 0) || ((delta & DMP_Data_Output_Control_1_Quat9) > 0) || ((delta & DMP_Data_Output_Control_1_Geomag) > 0))
++  {
++    delta2 |= DMP_Data_Output_Control_2_Compass_Accuracy;
++  }
++  // TO DO: Add DMP_Data_Output_Control_2_Pickup etc. if required
++
++  // Write the sensor control bits into memory address DATA_OUT_CTL1
++  unsigned char data_output_control_reg[2];
++  data_output_control_reg[0] = (unsigned char)(delta >> 8);
++  data_output_control_reg[1] = (unsigned char)(delta & 0xff);
++  pdev->_dataOutCtl1 = delta; // Diagnostics
++  result = inv_icm20948_write_mems(pdev, DATA_OUT_CTL1, 2, (const unsigned char *)&data_output_control_reg);
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  // Write the 'header2' sensor control bits into memory address DATA_OUT_CTL2
++  data_output_control_reg[0] = (unsigned char)(delta2 >> 8);
++  data_output_control_reg[1] = (unsigned char)(delta2 & 0xff);
++  pdev->_dataOutCtl2 = delta2; // Diagnostics
++  result = inv_icm20948_write_mems(pdev, DATA_OUT_CTL2, 2, (const unsigned char *)&data_output_control_reg);
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  // Set the DATA_RDY_STATUS register
++  data_output_control_reg[0] = (unsigned char)(data_rdy_status >> 8);
++  data_output_control_reg[1] = (unsigned char)(data_rdy_status & 0xff);
++  pdev->_dataRdyStatus = data_rdy_status; // Diagnostics
++  result = inv_icm20948_write_mems(pdev, DATA_RDY_STATUS, 2, (const unsigned char *)&data_output_control_reg);
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  // Check which extra bits need to be set in the Motion Event Control register
++  if ((delta & DMP_Data_Output_Control_1_Quat9) > 0)
++  {
++    inv_event_control |= DMP_Motion_Event_Control_9axis;
++  }
++  if (((delta & DMP_Data_Output_Control_1_Step_Detector) > 0) || ((delta & DMP_Data_Output_Control_1_Step_Ind_0) > 0) || ((delta & DMP_Data_Output_Control_1_Step_Ind_1) > 0) || ((delta & DMP_Data_Output_Control_1_Step_Ind_2) > 0))
++  {
++    inv_event_control |= DMP_Motion_Event_Control_Pedometer_Interrupt;
++  }
++  if ((delta & DMP_Data_Output_Control_1_Geomag) > 0)
++  {
++    inv_event_control |= DMP_Motion_Event_Control_Geomag;
++  }
++
++  // Set the MOTION_EVENT_CTL register
++  data_output_control_reg[0] = (unsigned char)(inv_event_control >> 8);
++  data_output_control_reg[1] = (unsigned char)(inv_event_control & 0xff);
++  pdev->_motionEventCtl = inv_event_control; // Diagnostics
++  result = inv_icm20948_write_mems(pdev, MOTION_EVENT_CTL, 2, (const unsigned char *)&data_output_control_reg);
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  result = ICM_20948_low_power(pdev, true); // Put chip into low power state
++  if (result != ICM_20948_Stat_Ok)
++    return result;
++
++  return result;
++}
++
++ICM_20948_Status_e inv_icm20948_enable_dmp_sensor_int(ICM_20948_Device_t *pdev, enum inv_icm20948_sensor sensor, int state)
++{
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++
++  if (pdev->_dmp_firmware_available == false)
++    return ICM_20948_Stat_DMPNotSupported; // Bail if DMP is not supported
++
++  uint8_t androidSensor = sensor_type_2_android_sensor(sensor); // Convert sensor from enum inv_icm20948_sensor to Android numbering
++
++  if (androidSensor > ANDROID_SENSOR_NUM_MAX)
++    return ICM_20948_Stat_SensorNotSupported; // Bail if the sensor is not supported
++
++  // Convert the Android sensor into a bit mask for DATA_OUT_CTL1
++  uint16_t delta = inv_androidSensor_to_control_bits[androidSensor];
++  if (delta == 0xFFFF)
++    return ICM_20948_Stat_SensorNotSupported; // Bail if the sensor is not supported
++
++  // Convert the Android sensor number into a bitmask and set or clear that bit in _enabled_Android_intr_0 / _enabled_Android_intr_1
++  unsigned long androidSensorAsBitMask;
++  if (androidSensor < 32) // Sensors 0-31
++  {
++    androidSensorAsBitMask = 1L << androidSensor;
++    if (state == 0) // Should we disable the sensor interrupt?
++    {
++      pdev->_enabled_Android_intr_0 &= ~androidSensorAsBitMask; // Clear the bit to disable the sensor interrupt
++    }
++    else
++    {
++      pdev->_enabled_Android_intr_0 |= androidSensorAsBitMask; // Set the bit to enable the sensor interrupt
++    }
++  }
++  else // Sensors 32-
++  {
++    androidSensorAsBitMask = 1L << (androidSensor - 32);
++    if (state == 0) // Should we disable the sensor?
++    {
++      pdev->_enabled_Android_intr_1 &= ~androidSensorAsBitMask; // Clear the bit to disable the sensor interrupt
++    }
++    else
++    {
++      pdev->_enabled_Android_intr_1 |= androidSensorAsBitMask; // Set the bit to enable the sensor interrupt
++    }
++  }
++
++  // Now we know androidSensor is valid, reconstruct the value for DATA_INTR_CTL from _enabled_Android_intr_0 and _enabled_Android_intr_0
++  delta = 0; // Clear delta
++  for (int i = 0; i < 32; i++)
++  {
++    androidSensorAsBitMask = 1L << i;
++    if ((pdev->_enabled_Android_intr_0 & androidSensorAsBitMask) > 0) // Check if the Android sensor (0-31) interrupt is enabled
++    {
++      delta |= inv_androidSensor_to_control_bits[i]; // If it is, or the required bits into delta
++    }
++    if ((pdev->_enabled_Android_intr_1 & androidSensorAsBitMask) > 0) // Check if the Android sensor (32-) interrupt is enabled
++    {
++      delta |= inv_androidSensor_to_control_bits[i + 32]; // If it is, or the required bits into delta
++    }
++  }
++
++  result = ICM_20948_sleep(pdev, false); // Make sure chip is awake
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  result = ICM_20948_low_power(pdev, false); // Make sure chip is not in low power state
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  unsigned char data_intr_ctl[2];
++
++  data_intr_ctl[0] = (unsigned char)(delta >> 8);
++  data_intr_ctl[1] = (unsigned char)(delta & 0xff);
++  pdev->_dataIntrCtl = delta; // Diagnostics
++  
++  // Write the interrupt control bits into memory address DATA_INTR_CTL
++  result = inv_icm20948_write_mems(pdev, DATA_INTR_CTL, 2, (const unsigned char *)&data_intr_ctl);
++
++  result = ICM_20948_low_power(pdev, true); // Put chip into low power state
++  if (result != ICM_20948_Stat_Ok)
++    return result;
++
++  return result;
++}
++
++ICM_20948_Status_e inv_icm20948_read_dmp_data(ICM_20948_Device_t *pdev, icm_20948_DMP_data_t *data)
++{
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++  uint8_t fifoBytes[icm_20948_DMP_Maximum_Bytes]; // Interim storage for the FIFO data
++
++  if (pdev->_dmp_firmware_available == false)
++    return ICM_20948_Stat_DMPNotSupported;
++
++  // Check how much data is in the FIFO
++  uint16_t fifo_count;
++  result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++  if (result != ICM_20948_Stat_Ok)
++    return result;
++
++  if (fifo_count < icm_20948_DMP_Header_Bytes) // Has a 2-byte header arrived?
++    return ICM_20948_Stat_FIFONoDataAvail;     // Bail if no header is available
++
++  // Read the header (2 bytes)
++  data->header = 0; // Clear the existing header
++  uint16_t aShort = 0;
++  result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Header_Bytes);
++  if (result != ICM_20948_Stat_Ok)
++    return result;
++  for (int i = 0; i < icm_20948_DMP_Header_Bytes; i++)
++  {
++    aShort |= ((uint16_t)fifoBytes[i]) << (8 - (i * 8)); // MSB first
++  }
++  data->header = aShort;                    // Store the header in data->header
++  fifo_count -= icm_20948_DMP_Header_Bytes; // Decrement the count
++
++  // If the header indicates a header2 is present then read that now
++  data->header2 = 0;                                  // Clear the existing header2
++  if ((data->header & DMP_header_bitmap_Header2) > 0) // If the header2 bit is set
++  {
++    if (fifo_count < icm_20948_DMP_Header2_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Header2_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if no header2 is available
++    // Read the header (2 bytes)
++    aShort = 0;
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Header2_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Header2_Bytes; i++)
++    {
++      aShort |= ((uint16_t)fifoBytes[i]) << (8 - (i * 8));
++    }
++    data->header2 = aShort;                    // Store the header2 in data->header2
++    fifo_count -= icm_20948_DMP_Header2_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Accel) > 0) // case DMP_header_bitmap_Accel:
++  {
++    if (fifo_count < icm_20948_DMP_Raw_Accel_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Raw_Accel_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Raw_Accel_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Raw_Accel_Bytes; i++)
++    {
++      data->Raw_Accel.Bytes[DMP_PQuat6_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++    }
++    fifo_count -= icm_20948_DMP_Raw_Accel_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Gyro) > 0) // case DMP_header_bitmap_Gyro:
++  {
++    if (fifo_count < (icm_20948_DMP_Raw_Gyro_Bytes + icm_20948_DMP_Gyro_Bias_Bytes)) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < (icm_20948_DMP_Raw_Gyro_Bytes + icm_20948_DMP_Gyro_Bias_Bytes))
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], (icm_20948_DMP_Raw_Gyro_Bytes + icm_20948_DMP_Gyro_Bias_Bytes));
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < (icm_20948_DMP_Raw_Gyro_Bytes + icm_20948_DMP_Gyro_Bias_Bytes); i++)
++    {
++      data->Raw_Gyro.Bytes[DMP_Raw_Gyro_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++    }
++    fifo_count -= (icm_20948_DMP_Raw_Gyro_Bytes + icm_20948_DMP_Gyro_Bias_Bytes); // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Compass) > 0) // case DMP_header_bitmap_Compass:
++  {
++    if (fifo_count < icm_20948_DMP_Compass_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Compass_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Compass_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Compass_Bytes; i++)
++    {
++      data->Compass.Bytes[DMP_PQuat6_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++    }
++    fifo_count -= icm_20948_DMP_Compass_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_ALS) > 0) // case DMP_header_bitmap_ALS:
++  {
++    if (fifo_count < icm_20948_DMP_ALS_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_ALS_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_ALS_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_ALS_Bytes; i++)
++    {
++      data->ALS[i] = fifoBytes[i];
++    }
++    fifo_count -= icm_20948_DMP_ALS_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Quat6) > 0) // case DMP_header_bitmap_Quat6:
++  {
++    if (fifo_count < icm_20948_DMP_Quat6_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Quat6_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Quat6_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Quat6_Bytes; i++)
++    {
++      data->Quat6.Bytes[DMP_Quat6_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++    }
++    fifo_count -= icm_20948_DMP_Quat6_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Quat9) > 0) // case DMP_header_bitmap_Quat9:
++  {
++    if (fifo_count < icm_20948_DMP_Quat9_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Quat9_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Quat9_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Quat9_Bytes; i++)
++    {
++      data->Quat9.Bytes[DMP_Quat9_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++    }
++    fifo_count -= icm_20948_DMP_Quat9_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_PQuat6) > 0) // case DMP_header_bitmap_PQuat6:
++  {
++    if (fifo_count < icm_20948_DMP_PQuat6_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_PQuat6_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_PQuat6_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_PQuat6_Bytes; i++)
++    {
++      data->PQuat6.Bytes[DMP_PQuat6_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++    }
++    fifo_count -= icm_20948_DMP_PQuat6_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Geomag) > 0) // case DMP_header_bitmap_Geomag:
++  {
++    if (fifo_count < icm_20948_DMP_Geomag_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Geomag_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Geomag_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Geomag_Bytes; i++)
++    {
++      data->Geomag.Bytes[DMP_Quat9_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++    }
++    fifo_count -= icm_20948_DMP_Geomag_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Pressure) > 0) // case DMP_header_bitmap_Pressure:
++  {
++    if (fifo_count < icm_20948_DMP_Pressure_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Pressure_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Pressure_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Pressure_Bytes; i++)
++    {
++      data->Pressure[i] = fifoBytes[i];
++    }
++    fifo_count -= icm_20948_DMP_Pressure_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Gyro_Calibr) > 0) // case DMP_header_bitmap_Gyro_Calibr:
++  {
++    // lcm20948MPUFifoControl.c suggests icm_20948_DMP_Gyro_Calibr_Bytes is not supported
++    // and looking at DMP frames which have the Gyro_Calibr bit set, that certainly seems to be true.
++    // So, we'll skip this...:
++    /*
++			if (fifo_count < icm_20948_DMP_Gyro_Calibr_Bytes) // Check if we need to read the FIFO count again
++			{
++					result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++					if (result != ICM_20948_Stat_Ok)
++							return result;
++			}
++			if (fifo_count < icm_20948_DMP_Gyro_Calibr_Bytes)
++					return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++			result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Gyro_Calibr_Bytes);
++			if (result != ICM_20948_Stat_Ok)
++					return result;
++			for (int i = 0; i < icm_20948_DMP_Gyro_Calibr_Bytes; i++)
++			{
++					data->Gyro_Calibr.Bytes[DMP_Quat6_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++			}
++			fifo_count -= icm_20948_DMP_Gyro_Calibr_Bytes; // Decrement the count
++			*/
++  }
++
++  if ((data->header & DMP_header_bitmap_Compass_Calibr) > 0) // case DMP_header_bitmap_Compass_Calibr:
++  {
++    if (fifo_count < icm_20948_DMP_Compass_Calibr_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Compass_Calibr_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Compass_Calibr_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Compass_Calibr_Bytes; i++)
++    {
++      data->Compass_Calibr.Bytes[DMP_Quat6_Byte_Ordering[i]] = fifoBytes[i]; // Correct the byte order (map big endian to little endian)
++    }
++    fifo_count -= icm_20948_DMP_Compass_Calibr_Bytes; // Decrement the count
++  }
++
++  if ((data->header & DMP_header_bitmap_Step_Detector) > 0) // case DMP_header_bitmap_Step_Detector:
++  {
++    if (fifo_count < icm_20948_DMP_Step_Detector_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Step_Detector_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Step_Detector_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    uint32_t aWord = 0;
++    for (int i = 0; i < icm_20948_DMP_Step_Detector_Bytes; i++)
++    {
++      aWord |= ((uint32_t)fifoBytes[i]) << (24 - (i * 8)); // MSB first
++    }
++    data->Pedometer_Timestamp = aWord;
++    fifo_count -= icm_20948_DMP_Step_Detector_Bytes; // Decrement the count
++  }
++
++  // Now check for header2 features
++
++  if ((data->header2 & DMP_header2_bitmap_Accel_Accuracy) > 0) // case DMP_header2_bitmap_Accel_Accuracy:
++  {
++    if (fifo_count < icm_20948_DMP_Accel_Accuracy_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Accel_Accuracy_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    aShort = 0;
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Accel_Accuracy_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Accel_Accuracy_Bytes; i++)
++    {
++      aShort |= ((uint16_t)fifoBytes[i]) << (8 - (i * 8));
++    }
++    data->Accel_Accuracy = aShort;
++    fifo_count -= icm_20948_DMP_Accel_Accuracy_Bytes; // Decrement the count
++  }
++
++  if ((data->header2 & DMP_header2_bitmap_Gyro_Accuracy) > 0) // case DMP_header2_bitmap_Gyro_Accuracy:
++  {
++    if (fifo_count < icm_20948_DMP_Gyro_Accuracy_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Gyro_Accuracy_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    aShort = 0;
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Gyro_Accuracy_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Gyro_Accuracy_Bytes; i++)
++    {
++      aShort |= ((uint16_t)fifoBytes[i]) << (8 - (i * 8));
++    }
++    data->Gyro_Accuracy = aShort;
++    fifo_count -= icm_20948_DMP_Gyro_Accuracy_Bytes; // Decrement the count
++  }
++
++  if ((data->header2 & DMP_header2_bitmap_Compass_Accuracy) > 0) // case DMP_header2_bitmap_Compass_Accuracy:
++  {
++    if (fifo_count < icm_20948_DMP_Compass_Accuracy_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Compass_Accuracy_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    aShort = 0;
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Compass_Accuracy_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Compass_Accuracy_Bytes; i++)
++    {
++      aShort |= ((uint16_t)fifoBytes[i]) << (8 - (i * 8));
++    }
++    data->Compass_Accuracy = aShort;
++    fifo_count -= icm_20948_DMP_Compass_Accuracy_Bytes; // Decrement the count
++  }
++
++  if ((data->header2 & DMP_header2_bitmap_Fsync) > 0) // case DMP_header2_bitmap_Fsync:
++  {
++    // lcm20948MPUFifoControl.c suggests icm_20948_DMP_Fsync_Detection_Bytes is not supported.
++    // So, we'll skip this just in case...:
++    /*
++			if (fifo_count < icm_20948_DMP_Fsync_Detection_Bytes) // Check if we need to read the FIFO count again
++			{
++					result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++					if (result != ICM_20948_Stat_Ok)
++							return result;
++			}
++			if (fifo_count < icm_20948_DMP_Fsync_Detection_Bytes)
++					return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++			aShort = 0;
++			result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Fsync_Detection_Bytes);
++			if (result != ICM_20948_Stat_Ok)
++					return result;
++			for (int i = 0; i < icm_20948_DMP_Fsync_Detection_Bytes; i++)
++			{
++					aShort |= ((uint16_t)fifoBytes[i]) << (8 - (i * 8));
++			}
++			data->Fsync_Delay_Time = aShort;
++			fifo_count -= icm_20948_DMP_Fsync_Detection_Bytes; // Decrement the count
++			*/
++  }
++
++  if ((data->header2 & DMP_header2_bitmap_Pickup) > 0) // case DMP_header2_bitmap_Pickup:
++  {
++    if (fifo_count < icm_20948_DMP_Pickup_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Pickup_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    aShort = 0;
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Pickup_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Pickup_Bytes; i++)
++    {
++      aShort |= ((uint16_t)fifoBytes[i]) << (8 - (i * 8));
++    }
++    data->Pickup = aShort;
++    fifo_count -= icm_20948_DMP_Pickup_Bytes; // Decrement the count
++  }
++
++  if ((data->header2 & DMP_header2_bitmap_Activity_Recog) > 0) // case DMP_header2_bitmap_Activity_Recog:
++  {
++    if (fifo_count < icm_20948_DMP_Activity_Recognition_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Activity_Recognition_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Activity_Recognition_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Activity_Recognition_Bytes; i++)
++    {
++      data->Activity_Recognition.Bytes[DMP_Activity_Recognition_Byte_Ordering[i]] = fifoBytes[i];
++    }
++    fifo_count -= icm_20948_DMP_Activity_Recognition_Bytes; // Decrement the count
++  }
++
++  if ((data->header2 & DMP_header2_bitmap_Secondary_On_Off) > 0) // case DMP_header2_bitmap_Secondary_On_Off:
++  {
++    if (fifo_count < icm_20948_DMP_Secondary_On_Off_Bytes) // Check if we need to read the FIFO count again
++    {
++      result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++      if (result != ICM_20948_Stat_Ok)
++        return result;
++    }
++    if (fifo_count < icm_20948_DMP_Secondary_On_Off_Bytes)
++      return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++    result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Secondary_On_Off_Bytes);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++    for (int i = 0; i < icm_20948_DMP_Secondary_On_Off_Bytes; i++)
++    {
++      data->Secondary_On_Off.Bytes[DMP_Secondary_On_Off_Byte_Ordering[i]] = fifoBytes[i];
++    }
++    fifo_count -= icm_20948_DMP_Secondary_On_Off_Bytes; // Decrement the count
++  }
++
++  // Finally, extract the footer (gyro count)
++  if (fifo_count < icm_20948_DMP_Footer_Bytes) // Check if we need to read the FIFO count again
++  {
++    result = ICM_20948_get_FIFO_count(pdev, &fifo_count);
++    if (result != ICM_20948_Stat_Ok)
++      return result;
++  }
++  if (fifo_count < icm_20948_DMP_Footer_Bytes)
++    return ICM_20948_Stat_FIFOIncompleteData; // Bail if not enough data is available
++  aShort = 0;
++  result = ICM_20948_read_FIFO(pdev, &fifoBytes[0], icm_20948_DMP_Footer_Bytes);
++  if (result != ICM_20948_Stat_Ok)
++    return result;
++  for (int i = 0; i < icm_20948_DMP_Footer_Bytes; i++)
++  {
++    aShort |= ((uint16_t)fifoBytes[i]) << (8 - (i * 8));
++  }
++  data->Footer = aShort;
++  fifo_count -= icm_20948_DMP_Footer_Bytes; // Decrement the count
++
++  if (fifo_count > 0) // Check if there is still data waiting to be read
++    return ICM_20948_Stat_FIFOMoreDataAvail;
++
++  return result;
++}
++
++uint8_t sensor_type_2_android_sensor(enum inv_icm20948_sensor sensor)
++{
++  switch (sensor)
++  {
++  case INV_ICM20948_SENSOR_ACCELEROMETER:
++    return ANDROID_SENSOR_ACCELEROMETER; // 1
++  case INV_ICM20948_SENSOR_GYROSCOPE:
++    return ANDROID_SENSOR_GYROSCOPE; // 4
++  case INV_ICM20948_SENSOR_RAW_ACCELEROMETER:
++    return ANDROID_SENSOR_RAW_ACCELEROMETER; // 42
++  case INV_ICM20948_SENSOR_RAW_GYROSCOPE:
++    return ANDROID_SENSOR_RAW_GYROSCOPE; // 43
++  case INV_ICM20948_SENSOR_MAGNETIC_FIELD_UNCALIBRATED:
++    return ANDROID_SENSOR_MAGNETIC_FIELD_UNCALIBRATED; // 14
++  case INV_ICM20948_SENSOR_GYROSCOPE_UNCALIBRATED:
++    return ANDROID_SENSOR_GYROSCOPE_UNCALIBRATED; // 16
++  case INV_ICM20948_SENSOR_ACTIVITY_CLASSIFICATON:
++    return ANDROID_SENSOR_ACTIVITY_CLASSIFICATON; // 47
++  case INV_ICM20948_SENSOR_STEP_DETECTOR:
++    return ANDROID_SENSOR_STEP_DETECTOR; // 18
++  case INV_ICM20948_SENSOR_STEP_COUNTER:
++    return ANDROID_SENSOR_STEP_COUNTER; // 19
++  case INV_ICM20948_SENSOR_GAME_ROTATION_VECTOR:
++    return ANDROID_SENSOR_GAME_ROTATION_VECTOR; // 15
++  case INV_ICM20948_SENSOR_ROTATION_VECTOR:
++    return ANDROID_SENSOR_ROTATION_VECTOR; // 11
++  case INV_ICM20948_SENSOR_GEOMAGNETIC_ROTATION_VECTOR:
++    return ANDROID_SENSOR_GEOMAGNETIC_ROTATION_VECTOR; // 20
++  case INV_ICM20948_SENSOR_GEOMAGNETIC_FIELD:
++    return ANDROID_SENSOR_GEOMAGNETIC_FIELD; // 2
++  case INV_ICM20948_SENSOR_WAKEUP_SIGNIFICANT_MOTION:
++    return ANDROID_SENSOR_WAKEUP_SIGNIFICANT_MOTION; // 17
++  case INV_ICM20948_SENSOR_FLIP_PICKUP:
++    return ANDROID_SENSOR_FLIP_PICKUP; // 46
++  case INV_ICM20948_SENSOR_WAKEUP_TILT_DETECTOR:
++    return ANDROID_SENSOR_WAKEUP_TILT_DETECTOR; // 41
++  case INV_ICM20948_SENSOR_GRAVITY:
++    return ANDROID_SENSOR_GRAVITY; // 9
++  case INV_ICM20948_SENSOR_LINEAR_ACCELERATION:
++    return ANDROID_SENSOR_LINEAR_ACCELERATION; // 10
++  case INV_ICM20948_SENSOR_ORIENTATION:
++    return ANDROID_SENSOR_ORIENTATION; // 3
++  case INV_ICM20948_SENSOR_B2S:
++    return ANDROID_SENSOR_B2S; // 45
++  default:
++    return ANDROID_SENSOR_NUM_MAX;
++  }
++}
++
++enum inv_icm20948_sensor inv_icm20948_sensor_android_2_sensor_type(int sensor)
++{
++  switch (sensor)
++  {
++  case ANDROID_SENSOR_ACCELEROMETER:
++    return INV_ICM20948_SENSOR_ACCELEROMETER;
++  case ANDROID_SENSOR_GYROSCOPE:
++    return INV_ICM20948_SENSOR_GYROSCOPE;
++  case ANDROID_SENSOR_RAW_ACCELEROMETER:
++    return INV_ICM20948_SENSOR_RAW_ACCELEROMETER;
++  case ANDROID_SENSOR_RAW_GYROSCOPE:
++    return INV_ICM20948_SENSOR_RAW_GYROSCOPE;
++  case ANDROID_SENSOR_MAGNETIC_FIELD_UNCALIBRATED:
++    return INV_ICM20948_SENSOR_MAGNETIC_FIELD_UNCALIBRATED;
++  case ANDROID_SENSOR_GYROSCOPE_UNCALIBRATED:
++    return INV_ICM20948_SENSOR_GYROSCOPE_UNCALIBRATED;
++  case ANDROID_SENSOR_ACTIVITY_CLASSIFICATON:
++    return INV_ICM20948_SENSOR_ACTIVITY_CLASSIFICATON;
++  case ANDROID_SENSOR_STEP_DETECTOR:
++    return INV_ICM20948_SENSOR_STEP_DETECTOR;
++  case ANDROID_SENSOR_STEP_COUNTER:
++    return INV_ICM20948_SENSOR_STEP_COUNTER;
++  case ANDROID_SENSOR_GAME_ROTATION_VECTOR:
++    return INV_ICM20948_SENSOR_GAME_ROTATION_VECTOR;
++  case ANDROID_SENSOR_ROTATION_VECTOR:
++    return INV_ICM20948_SENSOR_ROTATION_VECTOR;
++  case ANDROID_SENSOR_GEOMAGNETIC_ROTATION_VECTOR:
++    return INV_ICM20948_SENSOR_GEOMAGNETIC_ROTATION_VECTOR;
++  case ANDROID_SENSOR_GEOMAGNETIC_FIELD:
++    return INV_ICM20948_SENSOR_GEOMAGNETIC_FIELD;
++  case ANDROID_SENSOR_WAKEUP_SIGNIFICANT_MOTION:
++    return INV_ICM20948_SENSOR_WAKEUP_SIGNIFICANT_MOTION;
++  case ANDROID_SENSOR_FLIP_PICKUP:
++    return INV_ICM20948_SENSOR_FLIP_PICKUP;
++  case ANDROID_SENSOR_WAKEUP_TILT_DETECTOR:
++    return INV_ICM20948_SENSOR_WAKEUP_TILT_DETECTOR;
++  case ANDROID_SENSOR_GRAVITY:
++    return INV_ICM20948_SENSOR_GRAVITY;
++  case ANDROID_SENSOR_LINEAR_ACCELERATION:
++    return INV_ICM20948_SENSOR_LINEAR_ACCELERATION;
++  case ANDROID_SENSOR_ORIENTATION:
++    return INV_ICM20948_SENSOR_ORIENTATION;
++  case ANDROID_SENSOR_B2S:
++    return INV_ICM20948_SENSOR_B2S;
++  default:
++    return INV_ICM20948_SENSOR_MAX;
++  }
++}
++
++ICM_20948_Status_e inv_icm20948_set_gyro_sf(ICM_20948_Device_t *pdev, unsigned char div, int gyro_level)
++{
++  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
++
++  if (pdev->_dmp_firmware_available == false)
++    return ICM_20948_Stat_DMPNotSupported;
++
++  // gyro_level should be set to 4 regardless of fullscale, due to the addition of API dmp_icm20648_set_gyro_fsr()
++  gyro_level = 4;
++
++  // First read the TIMEBASE_CORRECTION_PLL register from Bank 1
++  int8_t pll; // Signed. Typical value is 0x18
++  result = ICM_20948_set_bank(pdev, 1);
++  result = ICM_20948_execute_r(pdev, AGB1_REG_TIMEBASE_CORRECTION_PLL, (uint8_t *)&pll, 1);
++  if (result != ICM_20948_Stat_Ok)
++  {
++    return result;
++  }
++
++  pdev->_gyroSFpll = pll; // Record the PLL value so we can debug print it
++
++  // Now calculate the Gyro SF using code taken from the InvenSense example (inv_icm20948_set_gyro_sf)
++
++  long gyro_sf;
++
++  unsigned long long const MagicConstant = 264446880937391LL;
++  unsigned long long const MagicConstantScale = 100000LL;
++  unsigned long long ResultLL;
++
++  if (pll & 0x80)
++  {
++    ResultLL = (MagicConstant * (long long)(1ULL << gyro_level) * (1 + div) / (1270 - (pll & 0x7F)) / MagicConstantScale);
++  }
++  else
++  {
++    ResultLL = (MagicConstant * (long long)(1ULL << gyro_level) * (1 + div) / (1270 + pll) / MagicConstantScale);
++  }
++  /*
++	    In above deprecated FP version, worst case arguments can produce a result that overflows a signed long.
++	    Here, for such cases, we emulate the FP behavior of setting the result to the maximum positive value, as
++	    the compiler's conversion of a u64 to an s32 is simple truncation of the u64's high half, sadly....
++	*/
++  if (ResultLL > 0x7FFFFFFF)
++    gyro_sf = 0x7FFFFFFF;
++  else
++    gyro_sf = (long)ResultLL;
++
++  pdev->_gyroSF = gyro_sf; // Record value so we can debug print it
++
++  // Finally, write the value to the DMP GYRO_SF register
++  unsigned char gyro_sf_reg[4];
++  gyro_sf_reg[0] = (unsigned char)(gyro_sf >> 24);
++  gyro_sf_reg[1] = (unsigned char)(gyro_sf >> 16);
++  gyro_sf_reg[2] = (unsigned char)(gyro_sf >> 8);
++  gyro_sf_reg[3] = (unsigned char)(gyro_sf & 0xff);
++  result = inv_icm20948_write_mems(pdev, GYRO_SF, 4, (const unsigned char*)&gyro_sf_reg);
++
++  return result;
++}
++
++
+diff --git a/board/project/cockpit/icm20948/ICM_20948_C.h b/board/project/cockpit/icm20948/ICM_20948_C.h
+new file mode 100644
+index 0000000..315c6a6
+--- /dev/null
++++ b/board/project/cockpit/icm20948/ICM_20948_C.h
+@@ -0,0 +1,311 @@
++/*
++
++This is a C-compatible interface to the features presented by the ICM 20948 9-axis device
++The imementation of the interface is flexible
++
++*/
++
++#ifndef _ICM_20948_C_H_
++#define _ICM_20948_C_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++#include "ICM_20948_REGISTERS.h"
++#include "ICM_20948_ENUMERATIONS.h" // This is to give users access to usable value definiitons
++#include "AK09916_ENUMERATIONS.h"
++#include "ICM_20948_DMP.h"
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif /* __cplusplus */
++
++// Portduino target uses system memcmp call, which conflicts with this
++#ifdef PORTDUINO
++#include <string.h>
++#else
++extern int memcmp(const void *, const void *, size_t); // Avoid compiler warnings
++#endif
++
++// Define if the DMP will be supported
++// Note: you must have 14290/14301 Bytes of program memory available to store the DMP firmware!
++//#define ICM_20948_USE_DMP // Uncomment this line to enable DMP support. You can of course use ICM_20948_USE_DMP as a compiler flag too
++
++// There are two versions of the InvenSense DMP firmware for the ICM20948 - with slightly different sizes
++#define DMP_CODE_SIZE 14301 /* eMD-SmartMotion-ICM20948-1.1.0-MP */
++//#define DMP_CODE_SIZE 14290 /* ICM20948_eMD_nucleo_1.0 */
++
++
++#define ICM_20948_I2C_ADDR_AD0 0x68 // Or 0x69 when AD0 is high
++#define ICM_20948_I2C_ADDR_AD1 0x69 //
++#define ICM_20948_WHOAMI 0xEA
++
++#define MAG_AK09916_I2C_ADDR 0x0C
++#define MAG_AK09916_WHO_AM_I 0x4809
++#define MAG_REG_WHO_AM_I 0x00
++
++/** @brief Max size that can be read across I2C or SPI data lines */
++#define INV_MAX_SERIAL_READ 16
++/** @brief Max size that can be written across I2C or SPI data lines */
++#define INV_MAX_SERIAL_WRITE 16
++
++  typedef enum
++  {
++    ICM_20948_Stat_Ok = 0x00, // The only return code that means all is well
++    ICM_20948_Stat_Err,       // A general error
++    ICM_20948_Stat_NotImpl,   // Returned by virtual functions that are not implemented
++    ICM_20948_Stat_ParamErr,
++    ICM_20948_Stat_WrongID,
++    ICM_20948_Stat_InvalSensor, // Tried to apply a function to a sensor that does not support it (e.g. DLPF to the temperature sensor)
++    ICM_20948_Stat_NoData,
++    ICM_20948_Stat_SensorNotSupported,
++    ICM_20948_Stat_DMPNotSupported,    // DMP not supported (no #define ICM_20948_USE_DMP)
++    ICM_20948_Stat_DMPVerifyFail,      // DMP was written but did not verify correctly
++    ICM_20948_Stat_FIFONoDataAvail,    // FIFO contains no data
++    ICM_20948_Stat_FIFOIncompleteData, // FIFO contained incomplete data
++    ICM_20948_Stat_FIFOMoreDataAvail,  // FIFO contains more data
++    ICM_20948_Stat_UnrecognisedDMPHeader,
++    ICM_20948_Stat_UnrecognisedDMPHeader2,
++    ICM_20948_Stat_InvalDMPRegister, // Invalid DMP Register
++
++    ICM_20948_Stat_NUM,
++    ICM_20948_Stat_Unknown,
++  } ICM_20948_Status_e;
++
++  typedef enum
++  {
++    ICM_20948_Internal_Acc = (1 << 0),
++    ICM_20948_Internal_Gyr = (1 << 1),
++    ICM_20948_Internal_Mag = (1 << 2),
++    ICM_20948_Internal_Tmp = (1 << 3),
++    ICM_20948_Internal_Mst = (1 << 4), // I2C Master Ineternal
++  } ICM_20948_InternalSensorID_bm;     // A bitmask of internal sensor IDs
++
++  typedef union
++  {
++    int16_t i16bit[3];
++    uint8_t u8bit[6];
++  } ICM_20948_axis3bit16_t;
++
++  typedef union
++  {
++    int16_t i16bit;
++    uint8_t u8bit[2];
++  } ICM_20948_axis1bit16_t;
++
++  typedef struct
++  {
++    uint8_t a : 2;
++    uint8_t g : 2;
++    uint8_t reserved_0 : 4;
++  } ICM_20948_fss_t; // Holds full-scale settings to be able to extract measurements with units
++
++  typedef struct
++  {
++    uint8_t a;
++    uint8_t g;
++  } ICM_20948_dlpcfg_t; // Holds digital low pass filter settings. Members are type ICM_20948_ACCEL_CONFIG_DLPCFG_e
++
++  typedef struct
++  {
++    uint16_t a;
++    uint8_t g;
++  } ICM_20948_smplrt_t;
++
++  typedef struct
++  {
++    uint8_t I2C_MST_INT_EN : 1;
++    uint8_t DMP_INT1_EN : 1;
++    uint8_t PLL_RDY_EN : 1;
++    uint8_t WOM_INT_EN : 1;
++    uint8_t REG_WOF_EN : 1;
++    uint8_t RAW_DATA_0_RDY_EN : 1;
++    uint8_t FIFO_OVERFLOW_EN_4 : 1;
++    uint8_t FIFO_OVERFLOW_EN_3 : 1;
++    uint8_t FIFO_OVERFLOW_EN_2 : 1;
++    uint8_t FIFO_OVERFLOW_EN_1 : 1;
++    uint8_t FIFO_OVERFLOW_EN_0 : 1;
++    uint8_t FIFO_WM_EN_4 : 1;
++    uint8_t FIFO_WM_EN_3 : 1;
++    uint8_t FIFO_WM_EN_2 : 1;
++    uint8_t FIFO_WM_EN_1 : 1;
++    uint8_t FIFO_WM_EN_0 : 1;
++  } ICM_20948_INT_enable_t;
++
++  typedef union
++  {
++    ICM_20948_axis3bit16_t raw;
++    struct
++    {
++      int16_t x;
++      int16_t y;
++      int16_t z;
++    } axes;
++  } ICM_20948_axis3named_t;
++
++  typedef struct
++  {
++    ICM_20948_axis3named_t acc;
++    ICM_20948_axis3named_t gyr;
++    ICM_20948_axis3named_t mag;
++    union
++    {
++      ICM_20948_axis1bit16_t raw;
++      int16_t val;
++    } tmp;
++    ICM_20948_fss_t fss; // Full-scale range settings for this measurement
++    uint8_t magStat1;
++    uint8_t magStat2;
++  } ICM_20948_AGMT_t;
++
++  typedef struct
++  {
++    ICM_20948_Status_e (*write)(uint8_t regaddr, uint8_t *pdata, uint32_t len, void *user);
++    ICM_20948_Status_e (*read)(uint8_t regaddr, uint8_t *pdata, uint32_t len, void *user);
++    // void				(*delay)(uint32_t ms);
++    void *user;
++  } ICM_20948_Serif_t;                      // This is the vtable of serial interface functions
++  extern const ICM_20948_Serif_t NullSerif; // Here is a default for initialization (NULL)
++
++  typedef struct
++  {
++    const ICM_20948_Serif_t *_serif; // Pointer to the assigned Serif (Serial Interface) vtable
++    bool _dmp_firmware_available;    // Indicates if the DMP firmware has been included. It
++    bool _firmware_loaded;           // Indicates if DMP has been loaded
++    uint8_t _last_bank;              // Keep track of which bank was selected last - to avoid unnecessary writes
++    uint8_t _last_mems_bank;         // Keep track of which bank was selected last - to avoid unnecessary writes
++    int32_t _gyroSF;                 // Use this to record the GyroSF, calculated by inv_icm20948_set_gyro_sf
++    int8_t _gyroSFpll;
++    uint32_t _enabled_Android_0;      // Keep track of which Android sensors are enabled: 0-31
++    uint32_t _enabled_Android_1;      // Keep track of which Android sensors are enabled: 32-
++    uint32_t _enabled_Android_intr_0; // Keep track of which Android sensor interrupts are enabled: 0-31
++    uint32_t _enabled_Android_intr_1; // Keep track of which Android sensor interrupts are enabled: 32-
++    uint16_t _dataOutCtl1;            // Diagnostics: record the setting of DATA_OUT_CTL1
++    uint16_t _dataOutCtl2;            // Diagnostics: record the setting of DATA_OUT_CTL2
++    uint16_t _dataRdyStatus;          // Diagnostics: record the setting of DATA_RDY_STATUS
++    uint16_t _motionEventCtl;         // Diagnostics: record the setting of MOTION_EVENT_CTL
++    uint16_t _dataIntrCtl;            // Diagnostics: record the setting of DATA_INTR_CTL
++  } ICM_20948_Device_t;               // Definition of device struct type
++
++  ICM_20948_Status_e ICM_20948_init_struct(ICM_20948_Device_t *pdev); // Initialize ICM_20948_Device_t
++
++  // ICM_20948_Status_e ICM_20948_Startup( ICM_20948_Device_t* pdev ); // For the time being this performs a standardized startup routine
++
++  ICM_20948_Status_e ICM_20948_link_serif(ICM_20948_Device_t *pdev, const ICM_20948_Serif_t *s); // Links a SERIF structure to the device
++
++  // use the device's serif to perform a read or write
++  ICM_20948_Status_e ICM_20948_execute_r(ICM_20948_Device_t *pdev, uint8_t regaddr, uint8_t *pdata, uint32_t len); // Executes a R or W witht he serif vt as long as the pointers are not null
++  ICM_20948_Status_e ICM_20948_execute_w(ICM_20948_Device_t *pdev, uint8_t regaddr, uint8_t *pdata, uint32_t len);
++
++  // Single-shot I2C on Master IF
++  ICM_20948_Status_e ICM_20948_i2c_controller_periph4_txn(ICM_20948_Device_t *pdev, uint8_t addr, uint8_t reg, uint8_t *data, uint8_t len, bool Rw, bool send_reg_addr);
++  ICM_20948_Status_e ICM_20948_i2c_master_single_w(ICM_20948_Device_t *pdev, uint8_t addr, uint8_t reg, uint8_t *data);
++  ICM_20948_Status_e ICM_20948_i2c_master_single_r(ICM_20948_Device_t *pdev, uint8_t addr, uint8_t reg, uint8_t *data);
++
++  // Device Level
++  ICM_20948_Status_e ICM_20948_set_bank(ICM_20948_Device_t *pdev, uint8_t bank);                                 // Sets the bank
++  ICM_20948_Status_e ICM_20948_sw_reset(ICM_20948_Device_t *pdev);                                               // Performs a SW reset
++  ICM_20948_Status_e ICM_20948_sleep(ICM_20948_Device_t *pdev, bool on);                                         // Set sleep mode for the chip
++  ICM_20948_Status_e ICM_20948_low_power(ICM_20948_Device_t *pdev, bool on);                                     // Set low power mode for the chip
++  ICM_20948_Status_e ICM_20948_set_clock_source(ICM_20948_Device_t *pdev, ICM_20948_PWR_MGMT_1_CLKSEL_e source); // Choose clock source
++  ICM_20948_Status_e ICM_20948_get_who_am_i(ICM_20948_Device_t *pdev, uint8_t *whoami);                          // Return whoami in out prarmeter
++  ICM_20948_Status_e ICM_20948_check_id(ICM_20948_Device_t *pdev);                                               // Return 'ICM_20948_Stat_Ok' if whoami matches ICM_20948_WHOAMI
++  ICM_20948_Status_e ICM_20948_data_ready(ICM_20948_Device_t *pdev);                                             // Returns 'Ok' if data is ready
++
++  // Interrupt Configuration
++  ICM_20948_Status_e ICM_20948_int_pin_cfg(ICM_20948_Device_t *pdev, ICM_20948_INT_PIN_CFG_t *write, ICM_20948_INT_PIN_CFG_t *read); // Set the INT pin configuration
++  ICM_20948_Status_e ICM_20948_int_enable(ICM_20948_Device_t *pdev, ICM_20948_INT_enable_t *write, ICM_20948_INT_enable_t *read);    // Write and or read the interrupt enable information. If non-null the write operation occurs before the read, so as to verify that the write was successful
++
++  // WoM Enable Logic configuration
++  ICM_20948_Status_e ICM_20948_wom_logic(ICM_20948_Device_t *pdev, ICM_20948_ACCEL_INTEL_CTRL_t *write, ICM_20948_ACCEL_INTEL_CTRL_t *read); //Enable or disable WoM Logic
++
++  // WoM Threshold Level Configuration
++  ICM_20948_Status_e ICM_20948_wom_threshold(ICM_20948_Device_t *pdev, ICM_20948_ACCEL_WOM_THR_t *write, ICM_20948_ACCEL_WOM_THR_t *read); // Write and or read the Wake on Motion threshold. If non-null the write operation occurs before the read, so as to verify that the write was successful
++
++  // Internal Sensor Options
++  ICM_20948_Status_e ICM_20948_set_sample_mode(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, ICM_20948_LP_CONFIG_CYCLE_e mode); // Use to set accel, gyro, and I2C master into cycled or continuous modes
++  ICM_20948_Status_e ICM_20948_set_full_scale(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, ICM_20948_fss_t fss);
++  ICM_20948_Status_e ICM_20948_set_dlpf_cfg(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, ICM_20948_dlpcfg_t cfg);
++  ICM_20948_Status_e ICM_20948_enable_dlpf(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, bool enable);
++  ICM_20948_Status_e ICM_20948_set_sample_rate(ICM_20948_Device_t *pdev, ICM_20948_InternalSensorID_bm sensors, ICM_20948_smplrt_t smplrt);
++
++  // Interface Things
++  ICM_20948_Status_e ICM_20948_i2c_master_passthrough(ICM_20948_Device_t *pdev, bool passthrough);
++  ICM_20948_Status_e ICM_20948_i2c_master_enable(ICM_20948_Device_t *pdev, bool enable);
++  ICM_20948_Status_e ICM_20948_i2c_master_reset(ICM_20948_Device_t *pdev);
++  ICM_20948_Status_e ICM_20948_i2c_controller_configure_peripheral(ICM_20948_Device_t *pdev, uint8_t peripheral, uint8_t addr, uint8_t reg, uint8_t len, bool Rw, bool enable, bool data_only, bool grp, bool swap, uint8_t dataOut);
++
++  // Higher Level
++  ICM_20948_Status_e ICM_20948_get_agmt(ICM_20948_Device_t *pdev, ICM_20948_AGMT_t *p);
++
++  // FIFO
++
++  ICM_20948_Status_e ICM_20948_enable_FIFO(ICM_20948_Device_t *pdev, bool enable);
++  ICM_20948_Status_e ICM_20948_reset_FIFO(ICM_20948_Device_t *pdev);
++  ICM_20948_Status_e ICM_20948_set_FIFO_mode(ICM_20948_Device_t *pdev, bool snapshot);
++  ICM_20948_Status_e ICM_20948_get_FIFO_count(ICM_20948_Device_t *pdev, uint16_t *count);
++  ICM_20948_Status_e ICM_20948_read_FIFO(ICM_20948_Device_t *pdev, uint8_t *data, uint8_t len);
++
++  // DMP
++
++  ICM_20948_Status_e ICM_20948_enable_DMP(ICM_20948_Device_t *pdev, bool enable);
++  ICM_20948_Status_e ICM_20948_reset_DMP(ICM_20948_Device_t *pdev);
++  ICM_20948_Status_e ICM_20948_firmware_load(ICM_20948_Device_t *pdev);
++  ICM_20948_Status_e ICM_20948_set_dmp_start_address(ICM_20948_Device_t *pdev, unsigned short address);
++
++  /** @brief Loads the DMP firmware from SRAM
++	* @param[in] data  pointer where the image
++	* @param[in] size  size if the image
++	* @param[in] load_addr  address to loading the image
++	* @return 0 in case of success, -1 for any error
++	*/
++  ICM_20948_Status_e inv_icm20948_firmware_load(ICM_20948_Device_t *pdev, const unsigned char *data, unsigned short size, unsigned short load_addr);
++  /**
++	*  @brief       Write data to a register in DMP memory
++	*  @param[in]   DMP memory address
++	*  @param[in]   number of byte to be written
++	*  @param[out]  output data from the register
++	*  @return     0 if successful.
++	*/
++  ICM_20948_Status_e inv_icm20948_write_mems(ICM_20948_Device_t *pdev, unsigned short reg, unsigned int length, const unsigned char *data);
++  /**
++	*  @brief      Read data from a register in DMP memory
++	*  @param[in]  DMP memory address
++	*  @param[in]  number of byte to be read
++	*  @param[in]  input data from the register
++	*  @return     0 if successful.
++	*/
++  ICM_20948_Status_e inv_icm20948_read_mems(ICM_20948_Device_t *pdev, unsigned short reg, unsigned int length, unsigned char *data);
++
++  ICM_20948_Status_e inv_icm20948_set_dmp_sensor_period(ICM_20948_Device_t *pdev, enum DMP_ODR_Registers odr_reg, uint16_t interval);
++  ICM_20948_Status_e inv_icm20948_enable_dmp_sensor(ICM_20948_Device_t *pdev, enum inv_icm20948_sensor sensor, int state);     // State is actually boolean
++  ICM_20948_Status_e inv_icm20948_enable_dmp_sensor_int(ICM_20948_Device_t *pdev, enum inv_icm20948_sensor sensor, int state); // State is actually boolean
++  uint8_t sensor_type_2_android_sensor(enum inv_icm20948_sensor sensor);
++  enum inv_icm20948_sensor inv_icm20948_sensor_android_2_sensor_type(int sensor);
++
++  ICM_20948_Status_e inv_icm20948_read_dmp_data(ICM_20948_Device_t *pdev, icm_20948_DMP_data_t *data);
++  ICM_20948_Status_e inv_icm20948_set_gyro_sf(ICM_20948_Device_t *pdev, unsigned char div, int gyro_level);
++
++  // ToDo:
++
++  /*
++	Want to access magnetometer throught the I2C master interface...
++
++  // If using the I2C master to read from the magnetometer
++  // Enable the I2C master to talk to the magnetometer through the ICM 20948
++  myICM.i2cMasterEnable( true );
++  SERIAL_PORT.print(F("Enabling the I2C master returned ")); SERIAL_PORT.println(myICM.statusString());
++  myICM.i2cControllerConfigurePeripheral ( 0, MAG_AK09916_I2C_ADDR, REG_ST1, 9, true, true, false, false, false );
++  SERIAL_PORT.print(F("Configuring the magnetometer peripheral returned ")); SERIAL_PORT.println(myICM.statusString());
++
++  // Operate the I2C master in duty-cycled mode
++  myICM.setSampleMode( (ICM_20948_Internal_Mst | ICM_20948_Internal_Gyr), ICM_20948_Sample_Mode_Cycled ); // options: ICM_20948_Sample_Mode_Continuous or ICM_20948_Sample_Mode_Cycled
++*/
++
++#ifdef __cplusplus
++}
++#endif /* __cplusplus */
++
++#endif /* _ICM_20948_C_H_ */
+diff --git a/board/project/cockpit/icm20948/ICM_20948_DMP.h b/board/project/cockpit/icm20948/ICM_20948_DMP.h
+new file mode 100644
+index 0000000..2354016
+--- /dev/null
++++ b/board/project/cockpit/icm20948/ICM_20948_DMP.h
+@@ -0,0 +1,695 @@
++/*
++
++This file contains a useful c translation of the DMP register map
++
++*/
++
++#ifndef _ICM_20948_DMP_H_
++#define _ICM_20948_DMP_H_
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif /* __cplusplus */
++
++#define DMP_START_ADDRESS ((unsigned short)0x1000)
++#define DMP_MEM_BANK_SIZE 256
++#define DMP_LOAD_START 0x90
++
++#define CFG_FIFO_SIZE (4222)
++
++// AGB0_REG_DMP_INT_STATUS bit definitions
++#define BIT_WAKE_ON_MOTION_INT 0x08
++#define BIT_MSG_DMP_INT 0x0002
++#define BIT_MSG_DMP_INT_0 0x0100 // CI Command
++
++#define BIT_MSG_DMP_INT_2 0x0200 // CIM Command - SMD
++#define BIT_MSG_DMP_INT_3 0x0400 // CIM Command - Pedometer
++
++#define BIT_MSG_DMP_INT_4 0x1000 // CIM Command - Pedometer binning
++#define BIT_MSG_DMP_INT_5 0x2000 // CIM Command - Bring To See Gesture
++#define BIT_MSG_DMP_INT_6 0x4000 // CIM Command - Look To See Gesture
++
++// Appendix I: DMP register addresses
++
++// data output control
++#define DATA_OUT_CTL1 (4 * 16) // 16-bit: Data output control 1 register : configure DMP to output required data
++#define DATA_OUT_CTL2 (4 * 16 + 2) // 16-bit: Data output control 2 register : configure the BM, accel/gyro/compass accuracy and gesture such as Pick-up
++#define DATA_INTR_CTL (4 * 16 + 12) // 16-bit: Determines which sensors can generate interrupt according to bit map defined for DATA_OUT_CTL1
++#define FIFO_WATERMARK (31 * 16 + 14) // 16-bit: DMP will send FIFO interrupt if FIFO count > FIFO watermark. FIFO watermark is set to 80% of actual FIFO size by default
++
++// motion event control
++#define MOTION_EVENT_CTL (4 * 16 + 14) // 16-bit: configure DMP for Android L and Invensense specific features
++
++// indicates to DMP which sensors are available
++/*	1: gyro samples available
++	2: accel samples available
++	8: secondary compass samples available	*/
++#define DATA_RDY_STATUS (8 * 16 + 10) // 16-bit: indicates to DMP which sensors are available
++
++// batch mode
++#define BM_BATCH_CNTR (27 * 16) // 32-bit: Batch counter
++#define BM_BATCH_THLD (19 * 16 + 12) // 32-bit: Batch mode threshold
++#define BM_BATCH_MASK (21 * 16 + 14) // 16-bit
++
++// sensor output data rate: all 16-bit
++#define ODR_ACCEL (11 * 16 + 14) // ODR_ACCEL Register for accel ODR
++#define ODR_GYRO (11 * 16 + 10) // ODR_GYRO Register for gyro ODR
++#define ODR_CPASS (11 * 16 + 6) // ODR_CPASS Register for compass ODR
++#define ODR_ALS (11 * 16 + 2) // ODR_ALS Register for ALS ODR
++#define ODR_QUAT6 (10 * 16 + 12) // ODR_QUAT6 Register for 6-axis quaternion ODR
++#define ODR_QUAT9 (10 * 16 + 8) // ODR_QUAT9 Register for 9-axis quaternion ODR
++#define ODR_PQUAT6 (10 * 16 + 4) // ODR_PQUAT6 Register for 6-axis pedometer quaternion ODR
++#define ODR_GEOMAG (10 * 16 + 0) // ODR_GEOMAG Register for Geomag rv ODR
++#define ODR_PRESSURE (11 * 16 + 12) // ODR_PRESSURE Register for pressure ODR
++#define ODR_GYRO_CALIBR (11 * 16 + 8) // ODR_GYRO_CALIBR Register for calibrated gyro ODR
++#define ODR_CPASS_CALIBR (11 * 16 + 4) // ODR_CPASS_CALIBR Register for calibrated compass ODR
++
++// sensor output data rate counter: all 16-bit
++#define ODR_CNTR_ACCEL (9 * 16 + 14) // ODR_CNTR_ACCEL Register for accel ODR counter
++#define ODR_CNTR_GYRO (9 * 16 + 10) // ODR_CNTR_GYRO Register for gyro ODR counter
++#define ODR_CNTR_CPASS (9 * 16 + 6) // ODR_CNTR_CPASS Register for compass ODR counter
++#define ODR_CNTR_ALS (9 * 16 + 2) // ODR_CNTR_ALS Register for ALS ODR counter
++#define ODR_CNTR_QUAT6 (8 * 16 + 12) // ODR_CNTR_QUAT6 Register for 6-axis quaternion ODR counter
++#define ODR_CNTR_QUAT9 (8 * 16 + 8) // ODR_CNTR_QUAT9 Register for 9-axis quaternion ODR counter
++#define ODR_CNTR_PQUAT6 (8 * 16 + 4) // ODR_CNTR_PQUAT6 Register for 6-axis pedometer quaternion ODR counter
++#define ODR_CNTR_GEOMAG (8 * 16 + 0) // ODR_CNTR_GEOMAG Register for Geomag rv ODR counter
++#define ODR_CNTR_PRESSURE (9 * 16 + 12) // ODR_CNTR_PRESSURE Register for pressure ODR counter
++#define ODR_CNTR_GYRO_CALIBR (9 * 16 + 8) // ODR_CNTR_GYRO_CALIBR Register for calibrated gyro ODR counter
++#define ODR_CNTR_CPASS_CALIBR (9 * 16 + 4) // ODR_CNTR_CPASS_CALIBR Register for calibrated compass ODR counter
++
++// mounting matrix: all 32-bit
++#define CPASS_MTX_00 (23 * 16) // Compass mount matrix and scale
++#define CPASS_MTX_01 (23 * 16 + 4) // Compass mount matrix and scale
++#define CPASS_MTX_02 (23 * 16 + 8) // Compass mount matrix and scale
++#define CPASS_MTX_10 (23 * 16 + 12) // Compass mount matrix and scale
++#define CPASS_MTX_11 (24 * 16) // Compass mount matrix and scale
++#define CPASS_MTX_12 (24 * 16 + 4) // Compass mount matrix and scale
++#define CPASS_MTX_20 (24 * 16 + 8) // Compass mount matrix and scale
++#define CPASS_MTX_21 (24 * 16 + 12) // Compass mount matrix and scale
++#define CPASS_MTX_22 (25 * 16) // Compass mount matrix and scale
++
++// bias calibration: all 32-bit
++// The biases are 32-bits in chip frame in hardware unit scaled by:
++// 2^12 (FSR 4g) for accel, 2^15 for gyro, in uT scaled by 2^16 for compass.
++#define GYRO_BIAS_X (139 * 16 + 4)
++#define GYRO_BIAS_Y (139 * 16 + 8)
++#define GYRO_BIAS_Z (139 * 16 + 12)
++#define ACCEL_BIAS_X (110 * 16 + 4)
++#define ACCEL_BIAS_Y (110 * 16 + 8)
++#define ACCEL_BIAS_Z (110 * 16 + 12)
++#define CPASS_BIAS_X (126 * 16 + 4)
++#define CPASS_BIAS_Y (126 * 16 + 8)
++#define CPASS_BIAS_Z (126 * 16 + 12)
++
++#define GYRO_ACCURACY (138 * 16 + 2)
++#define GYRO_BIAS_SET (138 * 16 + 6)
++#define GYRO_LAST_TEMPR (134 * 16)
++#define GYRO_SLOPE_X (78 * 16 + 4)
++#define GYRO_SLOPE_Y (78 * 16 + 8)
++#define GYRO_SLOPE_Z (78 * 16 + 12)
++
++// parameters for accel calibration
++#define ACCEL_ACCURACY (97 * 16)
++#define ACCEL_CAL_RESET (77 * 16)
++#define ACCEL_VARIANCE_THRESH (93 * 16)
++#define ACCEL_CAL_RATE (94 * 16 + 4) // 16-bit: 0 (225Hz, 112Hz, 56Hz)
++#define ACCEL_PRE_SENSOR_DATA (97 * 16 + 4)
++#define ACCEL_COVARIANCE (101 * 16 + 8)
++#define ACCEL_ALPHA_VAR (91 * 16) // 32-bit: 1026019965 (225Hz) 977872018 (112Hz) 882002213 (56Hz)
++#define ACCEL_A_VAR (92 * 16) // 32-bit: 47721859 (225Hz) 95869806 (112Hz) 191739611 (56Hz)
++#define ACCEL_CAL_INIT (94 * 16 + 2)
++#define ACCEL_CAL_SCALE_COVQ_IN_RANGE (194 * 16)
++#define ACCEL_CAL_SCALE_COVQ_OUT_RANGE (195 * 16)
++#define ACCEL_CAL_TEMPERATURE_SENSITIVITY (194 * 16 + 4)
++#define ACCEL_CAL_TEMPERATURE_OFFSET_TRIM (194 * 16 + 12)
++
++#define CPASS_ACCURACY (37 * 16)
++#define CPASS_BIAS_SET (34 * 16 + 14)
++#define MAR_MODE (37 * 16 + 2)
++#define CPASS_COVARIANCE (115 * 16)
++#define CPASS_COVARIANCE_CUR (118 * 16 + 8)
++#define CPASS_REF_MAG_3D (122 * 16)
++#define CPASS_CAL_INIT (114 * 16)
++#define CPASS_EST_FIRST_BIAS (113 * 16)
++#define MAG_DISTURB_STATE (113 * 16 + 2)
++#define CPASS_VAR_COUNT (112 * 16 + 6)
++#define CPASS_COUNT_7 (87 * 16 + 2)
++#define CPASS_MAX_INNO (124 * 16)
++#define CPASS_BIAS_OFFSET (113 * 16 + 4)
++#define CPASS_CUR_BIAS_OFFSET (114 * 16 + 4)
++#define CPASS_PRE_SENSOR_DATA (87 * 16 + 4)
++
++// Compass Cal params to be adjusted according to sampling rate
++#define CPASS_TIME_BUFFER (112 * 16 + 14)
++#define CPASS_RADIUS_3D_THRESH_ANOMALY (112 * 16 + 8)
++
++#define CPASS_STATUS_CHK (25 * 16 + 12)
++
++// gains
++#define ACCEL_FB_GAIN (34 * 16)
++#define ACCEL_ONLY_GAIN (16 * 16 + 12) // 32-bit: 15252014 (225Hz) 30504029 (112Hz) 61117001 (56Hz)
++#define GYRO_SF (19 * 16) // 32-bit: gyro scaling factor
++
++// 9-axis
++#define MAGN_THR_9X (80 * 16)
++#define MAGN_LPF_THR_9X (80 * 16 + 8)
++#define QFB_THR_9X (80 * 16 + 12)
++
++// DMP running counter
++#define DMPRATE_CNTR (18 * 16 + 4)
++
++// pedometer
++#define PEDSTD_BP_B (49 * 16 + 12)
++#define PEDSTD_BP_A4 (52 * 16)
++#define PEDSTD_BP_A3 (52 * 16 + 4)
++#define PEDSTD_BP_A2 (52 * 16 + 8)
++#define PEDSTD_BP_A1 (52 * 16 + 12)
++#define PEDSTD_SB (50 * 16 + 8)
++#define PEDSTD_SB_TIME (50 * 16 + 12)
++#define PEDSTD_PEAKTHRSH (57 * 16 + 8)
++#define PEDSTD_TIML (50 * 16 + 10)
++#define PEDSTD_TIMH (50 * 16 + 14)
++#define PEDSTD_PEAK (57 * 16 + 4)
++#define PEDSTD_STEPCTR (54 * 16)
++#define PEDSTD_STEPCTR2 (58 * 16 + 8)
++#define PEDSTD_TIMECTR (60 * 16 + 4)
++#define PEDSTD_DECI (58 * 16)
++#define PEDSTD_SB2 (60 * 16 + 14)
++#define STPDET_TIMESTAMP (18 * 16 + 8)
++#define PEDSTEP_IND (19 * 16 + 4)
++#define PED_Y_RATIO (17 * 16 + 0)
++
++// SMD
++#define SMD_VAR_TH (141 * 16 + 12)
++#define SMD_VAR_TH_DRIVE (143 * 16 + 12)
++#define SMD_DRIVE_TIMER_TH (143 * 16 + 8)
++#define SMD_TILT_ANGLE_TH (179 * 16 + 12)
++#define BAC_SMD_ST_TH (179 * 16 + 8)
++#define BAC_ST_ALPHA4 (180 * 16 + 12)
++#define BAC_ST_ALPHA4A (176 * 16 + 12)
++
++// Wake on Motion
++#define WOM_ENABLE (64 * 16 + 14)
++#define WOM_STATUS (64 * 16 + 6)
++#define WOM_THRESHOLD_DMP (64 * 16) // Renamed by PaulZC to avoid duplication with the Bank 2 Reg 0x13
++#define WOM_CNTR_TH (64 * 16 + 12)
++
++// Activity Recognition
++#define BAC_RATE (48 * 16 + 10)
++#define BAC_STATE (179 * 16 + 0)
++#define BAC_STATE_PREV (179 * 16 + 4)
++#define BAC_ACT_ON (182 * 16 + 0)
++#define BAC_ACT_OFF (183 * 16 + 0)
++#define BAC_STILL_S_F (177 * 16 + 0)
++#define BAC_RUN_S_F (177 * 16 + 4)
++#define BAC_DRIVE_S_F (178 * 16 + 0)
++#define BAC_WALK_S_F (178 * 16 + 4)
++#define BAC_SMD_S_F (178 * 16 + 8)
++#define BAC_BIKE_S_F (178 * 16 + 12)
++#define BAC_E1_SHORT (146 * 16 + 0)
++#define BAC_E2_SHORT (146 * 16 + 4)
++#define BAC_E3_SHORT (146 * 16 + 8)
++#define BAC_VAR_RUN (148 * 16 + 12)
++#define BAC_TILT_INIT (181 * 16 + 0)
++#define BAC_MAG_ON (225 * 16 + 0)
++#define BAC_PS_ON (74 * 16 + 0)
++#define BAC_BIKE_PREFERENCE (173 * 16 + 8)
++#define BAC_MAG_I2C_ADDR (229 * 16 + 8)
++#define BAC_PS_I2C_ADDR (75 * 16 + 4)
++#define BAC_DRIVE_CONFIDENCE (144 * 16 + 0)
++#define BAC_WALK_CONFIDENCE (144 * 16 + 4)
++#define BAC_SMD_CONFIDENCE (144 * 16 + 8)
++#define BAC_BIKE_CONFIDENCE (144 * 16 + 12)
++#define BAC_STILL_CONFIDENCE (145 * 16 + 0)
++#define BAC_RUN_CONFIDENCE (145 * 16 + 4)
++#define BAC_MODE_CNTR (150 * 16)
++#define BAC_STATE_T_PREV (185 * 16 + 4)
++#define BAC_ACT_T_ON (184 * 16 + 0)
++#define BAC_ACT_T_OFF (184 * 16 + 4)
++#define BAC_STATE_WRDBS_PREV (185 * 16 + 8)
++#define BAC_ACT_WRDBS_ON (184 * 16 + 8)
++#define BAC_ACT_WRDBS_OFF (184 * 16 + 12)
++#define BAC_ACT_ON_OFF (190 * 16 + 2)
++#define PREV_BAC_ACT_ON_OFF (188 * 16 + 2)
++#define BAC_CNTR (48 * 16 + 2)
++
++// Flip/Pick-up
++#define FP_VAR_ALPHA (245 * 16 + 8)
++#define FP_STILL_TH (246 * 16 + 4)
++#define FP_MID_STILL_TH (244 * 16 + 8)
++#define FP_NOT_STILL_TH (246 * 16 + 8)
++#define FP_VIB_REJ_TH (241 * 16 + 8)
++#define FP_MAX_PICKUP_T_TH (244 * 16 + 12)
++#define FP_PICKUP_TIMEOUT_TH (248 * 16 + 8)
++#define FP_STILL_CONST_TH (246 * 16 + 12)
++#define FP_MOTION_CONST_TH (240 * 16 + 8)
++#define FP_VIB_COUNT_TH (242 * 16 + 8)
++#define FP_STEADY_TILT_TH (247 * 16 + 8)
++#define FP_STEADY_TILT_UP_TH (242 * 16 + 12)
++#define FP_Z_FLAT_TH_MINUS (243 * 16 + 8)
++#define FP_Z_FLAT_TH_PLUS (243 * 16 + 12)
++#define FP_DEV_IN_POCKET_TH (76 * 16 + 12)
++#define FP_PICKUP_CNTR (247 * 16 + 4)
++#define FP_RATE (240 * 16 + 12)
++
++// Gyro FSR
++#define GYRO_FULLSCALE (72 * 16 + 12)
++
++// Accel FSR
++// The DMP scales accel raw data internally to align 1g as 2^25.
++// To do this and output hardware unit again as configured FSR, write 0x4000000 to ACC_SCALE DMP register, and write 0x40000 to ACC_SCALE2 DMP register.
++#define ACC_SCALE (30 * 16 + 0) // 32-bit: Write accel scaling value for internal use
++#define ACC_SCALE2 (79 * 16 + 4) // 32-bit: Write accel scaling down value
++
++// EIS authentication
++#define EIS_AUTH_INPUT (160 * 16 + 4)
++#define EIS_AUTH_OUTPUT (160 * 16 + 0)
++
++// B2S
++#define B2S_RATE (48 * 16 + 8)
++
++// B2S mounting matrix
++#define B2S_MTX_00 (208 * 16)
++#define B2S_MTX_01 (208 * 16 + 4)
++#define B2S_MTX_02 (208 * 16 + 8)
++#define B2S_MTX_10 (208 * 16 + 12)
++#define B2S_MTX_11 (209 * 16)
++#define B2S_MTX_12 (209 * 16 + 4)
++#define B2S_MTX_20 (209 * 16 + 8)
++#define B2S_MTX_21 (209 * 16 + 12)
++#define B2S_MTX_22 (210 * 16)
++
++// Dmp3 orientation parameters (Q30) initialization
++#define Q0_QUAT6 (33 * 16 + 0)
++#define Q1_QUAT6 (33 * 16 + 4)
++#define Q2_QUAT6 (33 * 16 + 8)
++#define Q3_QUAT6 (33 * 16 + 12)
++
++  enum DMP_ODR_Registers
++  {
++    DMP_ODR_Reg_Accel = ODR_ACCEL,              // ODR_ACCEL Register for accel ODR
++    DMP_ODR_Reg_Gyro = ODR_GYRO,                // ODR_GYRO Register for gyro ODR
++    DMP_ODR_Reg_Cpass = ODR_CPASS,              // ODR_CPASS Register for compass ODR
++    DMP_ODR_Reg_ALS = ODR_ALS,                  // ODR_ALS Register for ALS ODR
++    DMP_ODR_Reg_Quat6 = ODR_QUAT6,              // ODR_QUAT6 Register for 6-axis quaternion ODR
++    DMP_ODR_Reg_Quat9 = ODR_QUAT9,              // ODR_QUAT9 Register for 9-axis quaternion ODR
++    DMP_ODR_Reg_PQuat6 = ODR_PQUAT6,            // ODR_PQUAT6 Register for 6-axis pedometer quaternion ODR
++    DMP_ODR_Reg_Geomag = ODR_GEOMAG,            // ODR_GEOMAG Register for Geomag RV ODR
++    DMP_ODR_Reg_Pressure = ODR_PRESSURE,        // ODR_PRESSURE Register for pressure ODR
++    DMP_ODR_Reg_Gyro_Calibr = ODR_GYRO_CALIBR,  // ODR_GYRO_CALIBR Register for calibrated gyro ODR
++    DMP_ODR_Reg_Cpass_Calibr = ODR_CPASS_CALIBR // ODR_CPASS_CALIBR Register for calibrated compass ODR
++  };
++
++  /** @brief Sensor identifier for control function
++ */
++  enum inv_icm20948_sensor
++  {
++    INV_ICM20948_SENSOR_ACCELEROMETER = 0,
++    INV_ICM20948_SENSOR_GYROSCOPE,
++    INV_ICM20948_SENSOR_RAW_ACCELEROMETER,
++    INV_ICM20948_SENSOR_RAW_GYROSCOPE,
++    INV_ICM20948_SENSOR_MAGNETIC_FIELD_UNCALIBRATED,
++    INV_ICM20948_SENSOR_GYROSCOPE_UNCALIBRATED,
++    INV_ICM20948_SENSOR_ACTIVITY_CLASSIFICATON,
++    INV_ICM20948_SENSOR_STEP_DETECTOR,
++    INV_ICM20948_SENSOR_STEP_COUNTER,
++    INV_ICM20948_SENSOR_GAME_ROTATION_VECTOR,
++    INV_ICM20948_SENSOR_ROTATION_VECTOR,
++    INV_ICM20948_SENSOR_GEOMAGNETIC_ROTATION_VECTOR,
++    INV_ICM20948_SENSOR_GEOMAGNETIC_FIELD,
++    INV_ICM20948_SENSOR_WAKEUP_SIGNIFICANT_MOTION,
++    INV_ICM20948_SENSOR_FLIP_PICKUP,
++    INV_ICM20948_SENSOR_WAKEUP_TILT_DETECTOR,
++    INV_ICM20948_SENSOR_GRAVITY,
++    INV_ICM20948_SENSOR_LINEAR_ACCELERATION,
++    INV_ICM20948_SENSOR_ORIENTATION,
++    INV_ICM20948_SENSOR_B2S,
++    INV_ICM20948_SENSOR_RAW_MAGNETOMETER,
++    INV_ICM20948_SENSOR_MAX,
++  };
++
++  /* enum for android sensor*/
++  enum ANDROID_SENSORS
++  {
++    ANDROID_SENSOR_META_DATA = 0,               // 0
++    ANDROID_SENSOR_ACCELEROMETER,               // 1
++    ANDROID_SENSOR_GEOMAGNETIC_FIELD,           // 2
++    ANDROID_SENSOR_ORIENTATION,                 // 3
++    ANDROID_SENSOR_GYROSCOPE,                   // 4
++    ANDROID_SENSOR_LIGHT,                       // 5
++    ANDROID_SENSOR_PRESSURE,                    // 6
++    ANDROID_SENSOR_TEMPERATURE,                 // 7
++    ANDROID_SENSOR_WAKEUP_PROXIMITY,            // 8
++    ANDROID_SENSOR_GRAVITY,                     // 9
++    ANDROID_SENSOR_LINEAR_ACCELERATION,         // 10
++    ANDROID_SENSOR_ROTATION_VECTOR,             // 11
++    ANDROID_SENSOR_HUMIDITY,                    // 12
++    ANDROID_SENSOR_AMBIENT_TEMPERATURE,         // 13
++    ANDROID_SENSOR_MAGNETIC_FIELD_UNCALIBRATED, // 14
++    ANDROID_SENSOR_GAME_ROTATION_VECTOR,        // 15
++    ANDROID_SENSOR_GYROSCOPE_UNCALIBRATED,      // 16
++    ANDROID_SENSOR_WAKEUP_SIGNIFICANT_MOTION,   // 17
++    ANDROID_SENSOR_STEP_DETECTOR,               // 18
++    ANDROID_SENSOR_STEP_COUNTER,                // 19
++    ANDROID_SENSOR_GEOMAGNETIC_ROTATION_VECTOR, // 20
++    ANDROID_SENSOR_HEART_RATE,                  // 21
++    ANDROID_SENSOR_PROXIMITY,                   // 22
++
++    ANDROID_SENSOR_WAKEUP_ACCELEROMETER,               // 23
++    ANDROID_SENSOR_WAKEUP_MAGNETIC_FIELD,              // 24
++    ANDROID_SENSOR_WAKEUP_ORIENTATION,                 // 25
++    ANDROID_SENSOR_WAKEUP_GYROSCOPE,                   // 26
++    ANDROID_SENSOR_WAKEUP_LIGHT,                       // 27
++    ANDROID_SENSOR_WAKEUP_PRESSURE,                    // 28
++    ANDROID_SENSOR_WAKEUP_GRAVITY,                     // 29
++    ANDROID_SENSOR_WAKEUP_LINEAR_ACCELERATION,         // 30
++    ANDROID_SENSOR_WAKEUP_ROTATION_VECTOR,             // 31
++    ANDROID_SENSOR_WAKEUP_RELATIVE_HUMIDITY,           // 32
++    ANDROID_SENSOR_WAKEUP_AMBIENT_TEMPERATURE,         // 33
++    ANDROID_SENSOR_WAKEUP_MAGNETIC_FIELD_UNCALIBRATED, // 34
++    ANDROID_SENSOR_WAKEUP_GAME_ROTATION_VECTOR,        // 35
++    ANDROID_SENSOR_WAKEUP_GYROSCOPE_UNCALIBRATED,      // 36
++    ANDROID_SENSOR_WAKEUP_STEP_DETECTOR,               // 37
++    ANDROID_SENSOR_WAKEUP_STEP_COUNTER,                // 38
++    ANDROID_SENSOR_WAKEUP_GEOMAGNETIC_ROTATION_VECTOR, // 39
++    ANDROID_SENSOR_WAKEUP_HEART_RATE,                  // 40
++    ANDROID_SENSOR_WAKEUP_TILT_DETECTOR,               // 41
++    ANDROID_SENSOR_RAW_ACCELEROMETER,                  // 42
++    ANDROID_SENSOR_RAW_GYROSCOPE,                      // 43
++    ANDROID_SENSOR_NUM_MAX,                            // 44
++
++    ANDROID_SENSOR_B2S,                    // 45
++    ANDROID_SENSOR_FLIP_PICKUP,            // 46
++    ANDROID_SENSOR_ACTIVITY_CLASSIFICATON, // 47
++    ANDROID_SENSOR_SCREEN_ROTATION,        // 48
++    SELF_TEST,                             // 49
++    SETUP,                                 // 50
++    GENERAL_SENSORS_MAX                    // 51
++  };
++
++// Determines which base sensor needs to be on based upon ANDROID_SENSORS 0-31
++#define INV_NEEDS_ACCEL_MASK ((1L << 1) | (1L << 3) | (1L << 9) | (1L << 10) | (1L << 11) | (1L << 15) | (1L << 17) | (1L << 18) | (1L << 19) | (1L << 20) | (1L << 23) | (1L << 25) | (1L << 29) | (1L << 30) | (1L << 31))
++#define INV_NEEDS_GYRO_MASK ((1L << 3) | (1L << 4) | (1L << 9) | (1L << 10) | (1L << 11) | (1L << 15) | (1L << 16) | (1L << 25) | (1L << 26) | (1L << 29) | (1L << 30) | (1L << 31))
++#define INV_NEEDS_COMPASS_MASK ((1L << 2) | (1L << 3) | (1L << 11) | (1L << 14) | (1L << 20) | (1L << 24) | (1L << 25) | (1L << 31))
++#define INV_NEEDS_PRESSURE ((1L << 6) | (1L << 28))
++
++// Determines which base sensor needs to be on based upon ANDROID_SENSORS 32-
++#define INV_NEEDS_ACCEL_MASK1 ((1L << 3) | (1L << 5) | (1L << 6) | (1L << 7) | (1L << 9) | (1L << 10)) // I.e. 35, 37, 38, 39, 41, 42
++#define INV_NEEDS_GYRO_MASK1 ((1L << 3) | (1L << 4) | (1L << 11)) // I.e. 35, 36, 43
++#define INV_NEEDS_COMPASS_MASK1 ((1L << 2) | (1L << 7)) // I.e. 34 and 39
++
++  enum DMP_Data_Ready_Status_Register_Bits
++  {
++    DMP_Data_ready_Gyro = 0x0001,             // Gyro samples available
++    DMP_Data_ready_Accel = 0x0002,            // Accel samples available
++    DMP_Data_ready_Secondary_Compass = 0x0008 // Secondary compass samples available
++  };
++
++  enum DMP_Data_Output_Control_1_Register_Bits
++  {
++    DMP_Data_Output_Control_1_Step_Ind_0 = 0x0001,     // Pedometer Step Indicator Bit 0
++    DMP_Data_Output_Control_1_Step_Ind_1 = 0x0002,     // Pedometer Step Indicator Bit 1
++    DMP_Data_Output_Control_1_Step_Ind_2 = 0x0004,     // Pedometer Step Indicator Bit 2
++    DMP_Data_Output_Control_1_Header2 = 0x0008,        // Header 2
++    DMP_Data_Output_Control_1_Step_Detector = 0x0010,  // Pedometer Step Detector
++    DMP_Data_Output_Control_1_Compass_Calibr = 0x0020, // 32-bit calibrated compass
++    DMP_Data_Output_Control_1_Gyro_Calibr = 0x0040,    // 32-bit calibrated gyro
++    DMP_Data_Output_Control_1_Pressure = 0x0080,       // 16-bit Pressure
++    DMP_Data_Output_Control_1_Geomag = 0x0100,         // 32-bit Geomag rv + heading accuracy
++    DMP_Data_Output_Control_1_PQuat6 = 0x0200,         // 16-bit pedometer quaternion
++    DMP_Data_Output_Control_1_Quat9 = 0x0400,          // 32-bit 9-axis quaternion + heading accuracy
++    DMP_Data_Output_Control_1_Quat6 = 0x0800,          // 32-bit 6-axis quaternion
++    DMP_Data_Output_Control_1_ALS = 0x1000,            // 16-bit ALS
++    DMP_Data_Output_Control_1_Compass = 0x2000,        // 16-bit compass
++    DMP_Data_Output_Control_1_Gyro = 0x4000,           // 16-bit gyro
++    DMP_Data_Output_Control_1_Accel = 0x8000           // 16-bit accel
++  };
++
++  enum DMP_Data_Output_Control_2_Register_Bits
++  {
++    DMP_Data_Output_Control_2_Secondary_On_Off = 0x0040,
++    DMP_Data_Output_Control_2_Activity_Recognition_BAC = 0x0080,
++    DMP_Data_Output_Control_2_Batch_Mode_Enable = 0x0100,
++    DMP_Data_Output_Control_2_Pickup = 0x0400,
++    DMP_Data_Output_Control_2_Fsync_Detection = 0x0800,
++    DMP_Data_Output_Control_2_Compass_Accuracy = 0x1000,
++    DMP_Data_Output_Control_2_Gyro_Accuracy = 0x2000,
++    DMP_Data_Output_Control_2_Accel_Accuracy = 0x4000
++  };
++
++  enum DMP_Motion_Event_Control_Register_Bits
++  {
++    DMP_Motion_Event_Control_Activity_Recog_Pedom_Accel = 0x0002, // Activity Recognition / Pedometer accel only
++    DMP_Motion_Event_Control_Bring_Look_To_See = 0x0004,
++    DMP_Motion_Event_Control_Geomag = 0x0008, // Geomag rv
++    DMP_Motion_Event_Control_Pickup = 0x0010,
++    DMP_Motion_Event_Control_BTS = 0x0020,
++    DMP_Motion_Event_Control_9axis = 0x0040,
++    DMP_Motion_Event_Control_Compass_Calibr = 0x0080,
++    DMP_Motion_Event_Control_Gyro_Calibr = 0x0100,
++    DMP_Motion_Event_Control_Accel_Calibr = 0x0200,
++    DMP_Motion_Event_Control_Significant_Motion_Det = 0x0800,
++    DMP_Motion_Event_Control_Tilt_Interrupt = 0x1000,
++    DMP_Motion_Event_Control_Pedometer_Interrupt = 0x2000,
++    DMP_Motion_Event_Control_Activity_Recog_Pedom = 0x4000,
++    DMP_Motion_Event_Control_BAC_Wearable = 0x8000
++  };
++
++  enum DMP_Header_Bitmap
++  {
++    DMP_header_bitmap_Header2 = 0x0008,
++    DMP_header_bitmap_Step_Detector = 0x0010,
++    DMP_header_bitmap_Compass_Calibr = 0x0020,
++    DMP_header_bitmap_Gyro_Calibr = 0x0040,
++    DMP_header_bitmap_Pressure = 0x0080,
++    DMP_header_bitmap_Geomag = 0x0100,
++    DMP_header_bitmap_PQuat6 = 0x0200,
++    DMP_header_bitmap_Quat9 = 0x0400,
++    DMP_header_bitmap_Quat6 = 0x0800,
++    DMP_header_bitmap_ALS = 0x1000,
++    DMP_header_bitmap_Compass = 0x2000,
++    DMP_header_bitmap_Gyro = 0x4000,
++    DMP_header_bitmap_Accel = 0x8000
++  };
++
++  enum DMP_Header2_Bitmap
++  {
++    DMP_header2_bitmap_Secondary_On_Off = 0x0040,
++    DMP_header2_bitmap_Activity_Recog = 0x0080,
++    DMP_header2_bitmap_Pickup = 0x0400,
++    DMP_header2_bitmap_Fsync = 0x0800,
++    DMP_header2_bitmap_Compass_Accuracy = 0x1000,
++    DMP_header2_bitmap_Gyro_Accuracy = 0x2000,
++    DMP_header2_bitmap_Accel_Accuracy = 0x4000
++  };
++
++  typedef struct // DMP Activity Recognition data
++  {
++    uint8_t Drive : 1;
++    uint8_t Walk : 1;
++    uint8_t Run : 1;
++    uint8_t Bike : 1;
++    uint8_t Tilt : 1;
++    uint8_t Still : 1;
++    uint8_t reserved : 2;
++  } icm_20948_DMP_Activity_t;
++
++  typedef struct // DMP Secondary On/Off data
++  {
++    uint16_t Gyro_Off : 1;
++    uint16_t Gyro_On : 1;
++    uint16_t Compass_Off : 1;
++    uint16_t Compass_On : 1;
++    uint16_t Proximity_Off : 1;
++    uint16_t Proximity_On : 1;
++    uint16_t reserved : 10;
++  } icm_20948_DMP_Secondary_On_Off_t;
++
++#define icm_20948_DMP_Header_Bytes 2
++#define icm_20948_DMP_Header2_Bytes 2
++#define icm_20948_DMP_Raw_Accel_Bytes 6
++#define icm_20948_DMP_Raw_Gyro_Bytes 6
++#define icm_20948_DMP_Gyro_Bias_Bytes 6
++#define icm_20948_DMP_Compass_Bytes 6
++#define icm_20948_DMP_ALS_Bytes 8
++#define icm_20948_DMP_Quat6_Bytes 12
++#define icm_20948_DMP_Quat9_Bytes 14
++// <-- lcm20948MPUFifoControl.c suggests icm_20948_DMP_Step_Detector_Bytes comes here <--
++#define icm_20948_DMP_PQuat6_Bytes 6
++#define icm_20948_DMP_Geomag_Bytes 14
++#define icm_20948_DMP_Pressure_Bytes 6
++#define icm_20948_DMP_Gyro_Calibr_Bytes 12 // lcm20948MPUFifoControl.c suggests icm_20948_DMP_Gyro_Calibr_Bytes is not supported?
++#define icm_20948_DMP_Compass_Calibr_Bytes 12
++#define icm_20948_DMP_Step_Detector_Bytes 4 // See note above
++#define icm_20948_DMP_Accel_Accuracy_Bytes 2
++#define icm_20948_DMP_Gyro_Accuracy_Bytes 2
++#define icm_20948_DMP_Compass_Accuracy_Bytes 2
++#define icm_20948_DMP_Fsync_Detection_Bytes 2 // lcm20948MPUFifoControl.c suggests icm_20948_DMP_Fsync_Detection_Bytes is not supported?
++#define icm_20948_DMP_Pickup_Bytes 2
++#define icm_20948_DMP_Activity_Recognition_Bytes 6
++#define icm_20948_DMP_Secondary_On_Off_Bytes 2
++#define icm_20948_DMP_Footer_Bytes 2
++#define icm_20948_DMP_Maximum_Bytes 14 // The most bytes we will attempt to read from the FIFO in one go
++
++  typedef struct
++  {
++    uint16_t header;
++    uint16_t header2;
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Raw_Accel_Bytes];
++      struct
++      {
++        int16_t X;
++        int16_t Y;
++        int16_t Z;
++      } Data;
++    } Raw_Accel;
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Raw_Gyro_Bytes + icm_20948_DMP_Gyro_Bias_Bytes];
++      struct
++      {
++        int16_t X;
++        int16_t Y;
++        int16_t Z;
++        int16_t BiasX;
++        int16_t BiasY;
++        int16_t BiasZ;
++      } Data;
++    } Raw_Gyro;
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Compass_Bytes];
++      struct
++      {
++        int16_t X;
++        int16_t Y;
++        int16_t Z;
++      } Data;
++    } Compass;
++    uint8_t ALS[icm_20948_DMP_ALS_Bytes]; // Byte[0]: Dummy, Byte[2:1]: Ch0DATA, Byte[4:3]: Ch1DATA, Byte[6:5]: PDATA, Byte[7]: Dummy
++    // The 6-Axis and 9-axis Quaternion outputs each consist of 12 bytes of data.
++    // These 12 bytes in turn consists of three 4-byte elements.
++    // 9-axis quaternion data and Geomag rv is always followed by 2-bytes of heading accuracy, hence the size of Quat9 and Geomag data size in the FIFO is 14 bytes.
++    // Quaternion data for both cases is cumulative/integrated values.
++    // For a given quaternion Q, the ordering of its elements is {Q1, Q2, Q3}.
++    // Each element is represented using Big Endian byte order.
++    // Q0 value is computed from this equation: Q20 + Q21 + Q22 + Q23 = 1.
++    // In case of drift, the sum will not add to 1, therefore, quaternion data need to be corrected with right bias values.
++    // The quaternion data is scaled by 2^30.
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Quat6_Bytes];
++      struct
++      {
++        int32_t Q1;
++        int32_t Q2;
++        int32_t Q3;
++      } Data;
++    } Quat6;
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Quat9_Bytes];
++      struct
++      {
++        int32_t Q1;
++        int32_t Q2;
++        int32_t Q3;
++        int16_t Accuracy;
++      } Data;
++    } Quat9;
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_PQuat6_Bytes];
++      struct
++      {
++        int16_t Q1;
++        int16_t Q2;
++        int16_t Q3;
++      } Data;
++    } PQuat6;
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Geomag_Bytes];
++      struct
++      {
++        int32_t Q1;
++        int32_t Q2;
++        int32_t Q3;
++        int16_t Accuracy;
++      } Data;
++    } Geomag;
++    uint8_t Pressure[6]; // Byte [2:0]: Pressure data, Byte [5:3]: Temperature data
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Gyro_Calibr_Bytes];
++      struct
++      {
++        int32_t X;
++        int32_t Y;
++        int32_t Z;
++      } Data;
++    } Gyro_Calibr; // Hardware unit scaled by 2^15
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Compass_Calibr_Bytes];
++      struct
++      {
++        int32_t X;
++        int32_t Y;
++        int32_t Z;
++      } Data;
++    } Compass_Calibr;             // The unit is uT scaled by 2^16
++    uint32_t Pedometer_Timestamp; // Timestamp as DMP cycle
++    uint16_t Accel_Accuracy;      // The accuracy is expressed as 0~3. The lowest is 0 and 3 is the highest.
++    uint16_t Gyro_Accuracy;       // The accuracy is expressed as 0~3. The lowest is 0 and 3 is the highest.
++    uint16_t Compass_Accuracy;    // The accuracy is expressed as 0~3. The lowest is 0 and 3 is the highest.
++    uint16_t Fsync_Delay_Time;    // The data is delay time between Fsync event and the 1st ODR event after Fsync event.
++    uint16_t Pickup;              // The value “2” indicates pick up is detected.
++    // Activity Recognition data
++    // The data include Start and End states, and timestamp as DMP cycle.
++    // Byte [0]: State-Start, Byte [1]: State-End, Byte [5:2]: timestamp.
++    // The states are expressed as below.
++    // Drive: 0x01
++    // Walk: 0x02
++    // Run: 0x04
++    // Bike: 0x08
++    // Tilt: 0x10
++    // Still: 0x20
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Activity_Recognition_Bytes];
++      struct
++      {
++        icm_20948_DMP_Activity_t State_Start;
++        icm_20948_DMP_Activity_t State_End;
++        uint32_t Timestamp;
++      } Data;
++    } Activity_Recognition;
++    // Secondary On/Off data
++    // BAC algorithm requires sensors on/off through FIFO data to detect activities effectively and save power.
++    // The driver is expected to control sensors accordingly.
++    // The data indicates which sensor and on or off as below.
++    // Gyro Off: 0x01
++    // Gyro On: 0x02
++    // Compass Off: 0x04
++    // Compass On: 0x08
++    // Proximity Off: 0x10
++    // Proximity On: 0x20
++    union
++    {
++      uint8_t Bytes[icm_20948_DMP_Secondary_On_Off_Bytes];
++      icm_20948_DMP_Secondary_On_Off_t Sensors;
++    } Secondary_On_Off;
++    uint16_t Footer; // Gyro count?
++  } icm_20948_DMP_data_t;
++
++#ifdef __cplusplus
++}
++#endif /* __cplusplus */
++
++#endif /* _ICM_20948_REGISTERS_H_ */
+diff --git a/board/project/cockpit/icm20948/ICM_20948_ENUMERATIONS.h b/board/project/cockpit/icm20948/ICM_20948_ENUMERATIONS.h
+new file mode 100644
+index 0000000..18b2aca
+--- /dev/null
++++ b/board/project/cockpit/icm20948/ICM_20948_ENUMERATIONS.h
+@@ -0,0 +1,263 @@
++/*
++
++This file contains a useful c translation of the datasheet register map values
++
++*/
++
++#ifndef _ICM_20948_ENUMERATIONS_H_
++#define _ICM_20948_ENUMERATIONS_H_
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif /* __cplusplus */
++
++  // // Generalized
++  // REG_BANK_SEL = 0x7F,
++
++  // // Gyroscope and Accelerometer
++  // // User Bank 0
++  // AGB0_REG_WHO_AM_I = 0x00,
++  // 	// Break
++  // AGB0_REG_USER_CTRL = 0x03,
++  // 	// Break
++  // AGB0_REG_LP_CONFIG = 0x05,
++
++  typedef enum
++  {
++    ICM_20948_Sample_Mode_Continuous = 0x00,
++    ICM_20948_Sample_Mode_Cycled,
++  } ICM_20948_LP_CONFIG_CYCLE_e;
++
++  // AGB0_REG_PWR_MGMT_1,
++
++  typedef enum
++  {
++    ICM_20948_Clock_Internal_20MHz = 0x00,
++    ICM_20948_Clock_Auto,
++    ICM_20948_Clock_TimingReset = 0x07
++  } ICM_20948_PWR_MGMT_1_CLKSEL_e;
++
++  // AGB0_REG_PWR_MGMT_2,
++  // 	// Break
++  // AGB0_REG_INT_PIN_CONFIG = 0x0F,
++  // AGB0_REG_INT_ENABLE,
++  // AGB0_REG_INT_ENABLE_1,
++  // AGB0_REG_INT_ENABLE_2,
++  // AGB0_REG_INT_ENABLE_3,
++  // 	// Break
++  // AGB0_REG_I2C_MST_STATUS = 0x17,
++  // 	// Break
++  // AGB0_REG_INT_STATUS = 0x19,
++  // AGB0_REG_INT_STATUS_1,
++  // AGB0_REG_INT_STATUS_2,
++  // AGB0_REG_INT_STATUS_3,
++  // 	// Break
++  // AGB0_REG_DELAY_TIMEH = 0x28,
++  // AGB0_REG_DELAY_TIMEL,
++  // 	// Break
++  // AGB0_REG_ACCEL_XOUT_H = 0x2D,
++  // AGB0_REG_ACCEL_XOUT_L,
++  // AGB0_REG_ACCEL_YOUT_H,
++  // AGB0_REG_ACCEL_YOUT_L,
++  // AGB0_REG_ACCEL_ZOUT_H,
++  // AGB0_REG_ACCEL_ZOUT_L,
++  // AGB0_REG_GYRO_XOUT_H,
++  // AGB0_REG_GYRO_XOUT_L,
++  // AGB0_REG_GYRO_YOUT_H,
++  // AGB0_REG_GYRO_YOUT_L,
++  // AGB0_REG_GYRO_ZOUT_H,
++  // AGB0_REG_GYRO_ZOUT_L,
++  // AGB0_REG_TEMP_OUT_H,
++  // AGB0_REG_TEMP_OUT_L,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_00,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_01,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_02,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_03,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_04,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_05,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_06,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_07,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_08,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_09,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_10,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_11,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_12,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_13,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_14,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_15,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_16,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_17,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_18,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_19,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_20,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_21,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_22,
++  // AGB0_REG_EXT_PERIPH_SENS_DATA_23,
++  // 	// Break
++  // AGB0_REG_FIFO_EN_1 = 0x66,
++  // AGB0_REG_FIFO_EN_2,
++  // AGB0_REG_FIFO_MODE,
++  // 	// Break
++  // AGB0_REG_FIFO_COUNT_H = 0x70,
++  // AGB0_REG_FIFO_COUNT_L,
++  // AGB0_REG_FIFO_R_W,
++  // 	// Break
++  // AGB0_REG_DATA_RDY_STATUS = 0x74,
++  // 	// Break
++  // AGB0_REG_FIFO_CFG = 0x76,
++  // 	// Break
++  // AGB0_REG_MEM_START_ADDR 	= 0x7C,		// Hmm, Invensense thought they were sneaky not listing these locations on the datasheet...
++  // AGB0_REG_MEM_R_W 			= 0x7D,		// These three locations seem to be able to access some memory within the device
++  // AGB0_REG_MEM_BANK_SEL 		= 0x7E,		// And that location is also where the DMP image gets loaded
++  // AGB0_REG_REG_BANK_SEL = 0x7F,
++
++  // // Bank 1
++  // AGB1_REG_SELF_TEST_X_GYRO = 0x02,
++  // AGB1_REG_SELF_TEST_Y_GYRO,
++  // AGB1_REG_SELF_TEST_Z_GYRO,
++  // 	// Break
++  // AGB1_REG_SELF_TEST_X_ACCEL = 0x0E,
++  // AGB1_REG_SELF_TEST_Y_ACCEL,
++  // AGB1_REG_SELF_TEST_Z_ACCEL,
++  // 	// Break
++  // AGB1_REG_XA_OFFS_H = 0x14,
++  // AGB1_REG_XA_OFFS_L,
++  // 	// Break
++  // AGB1_REG_YA_OFFS_H = 0x17,
++  // AGB1_REG_YA_OFFS_L,
++  // 	// Break
++  // AGB1_REG_ZA_OFFS_H = 0x1A,
++  // AGB1_REG_ZA_OFFS_L,
++  // 	// Break
++  // AGB1_REG_TIMEBASE_CORRECTION_PLL = 0x28,
++  // 	// Break
++  // AGB1_REG_REG_BANK_SEL = 0x7F,
++
++  // // Bank 2
++  // AGB2_REG_GYRO_SMPLRT_DIV = 0x00,
++
++  /*
++Gyro sample rate divider. Divides the internal sample rate to generate the sample
++rate that controls sensor data output rate, FIFO sample rate, and DMP sequence rate.
++NOTE: This register is only effective when FCHOICE = 1’b1 (FCHOICE_B register bit is 1’b0), and
++(0 < DLPF_CFG < 7).
++ODR is computed as follows:
++1.1 kHz/(1+GYRO_SMPLRT_DIV[7:0])
++*/
++
++  // AGB2_REG_GYRO_CONFIG_1,
++
++  typedef enum
++  { // Full scale range options in degrees per second
++    dps250 = 0x00,
++    dps500,
++    dps1000,
++    dps2000,
++  } ICM_20948_GYRO_CONFIG_1_FS_SEL_e;
++
++  typedef enum
++  { // Format is dAbwB_nXbwY - A is integer part of 3db BW, B is fraction. X is integer part of nyquist bandwidth, Y is fraction
++    gyr_d196bw6_n229bw8 = 0x00,
++    gyr_d151bw8_n187bw6,
++    gyr_d119bw5_n154bw3,
++    gyr_d51bw2_n73bw3,
++    gyr_d23bw9_n35bw9,
++    gyr_d11bw6_n17bw8,
++    gyr_d5bw7_n8bw9,
++    gyr_d361bw4_n376bw5,
++  } ICM_20948_GYRO_CONFIG_1_DLPCFG_e;
++
++  // AGB2_REG_GYRO_CONFIG_2,
++  // AGB2_REG_XG_OFFS_USRH,
++  // AGB2_REG_XG_OFFS_USRL,
++  // AGB2_REG_YG_OFFS_USRH,
++  // AGB2_REG_YG_OFFS_USRL,
++  // AGB2_REG_ZG_OFFS_USRH,
++  // AGB2_REG_ZG_OFFS_USRL,
++  // AGB2_REG_ODR_ALIGN_EN,
++  // 	// Break
++  // AGB2_REG_ACCEL_SMPLRT_DIV_1 = 0x10,
++  // AGB2_REG_ACCEL_SMPLRT_DIV_2,
++  // AGB2_REG_ACCEL_INTEL_CTRL,
++  // AGB2_REG_ACCEL_WOM_THR,
++  // AGB2_REG_ACCEL_CONFIG,
++
++  typedef enum
++  {
++    gpm2 = 0x00,
++    gpm4,
++    gpm8,
++    gpm16,
++  } ICM_20948_ACCEL_CONFIG_FS_SEL_e;
++
++  typedef enum
++  { // Format is dAbwB_nXbwZ - A is integer part of 3db BW, B is fraction. X is integer part of nyquist bandwidth, Y is fraction
++    acc_d246bw_n265bw = 0x00,
++    acc_d246bw_n265bw_1,
++    acc_d111bw4_n136bw,
++    acc_d50bw4_n68bw8,
++    acc_d23bw9_n34bw4,
++    acc_d11bw5_n17bw,
++    acc_d5bw7_n8bw3,
++    acc_d473bw_n499bw,
++  } ICM_20948_ACCEL_CONFIG_DLPCFG_e;
++
++  // AGB2_REG_ACCEL_CONFIG_2,
++  // 	// Break
++  // AGB2_REG_FSYNC_CONFIG = 0x52,
++  // AGB2_REG_TEMP_CONFIG,
++  // AGB2_REG_MOD_CTRL_USR,
++  // 	// Break
++  // AGB2_REG_REG_BANK_SEL = 0x7F,
++
++  // // Bank 3
++  // AGB3_REG_I2C_MST_ODR_CONFIG = 0x00,
++  // AGB3_REG_I2C_MST_CTRL,
++  // AGB3_REG_I2C_MST_DELAY_CTRL,
++  // AGB3_REG_I2C_PERIPH0_ADDR,
++  // AGB3_REG_I2C_PERIPH0_REG,
++  // AGB3_REG_I2C_PERIPH0_CTRL,
++  // AGB3_REG_I2C_PERIPH0_DO,
++  // AGB3_REG_I2C_PERIPH1_ADDR,
++  // AGB3_REG_I2C_PERIPH1_REG,
++  // AGB3_REG_I2C_PERIPH1_CTRL,
++  // AGB3_REG_I2C_PERIPH1_DO,
++  // AGB3_REG_I2C_PERIPH2_ADDR,
++  // AGB3_REG_I2C_PERIPH2_REG,
++  // AGB3_REG_I2C_PERIPH2_CTRL,
++  // AGB3_REG_I2C_PERIPH2_DO,
++  // AGB3_REG_I2C_PERIPH3_ADDR,
++  // AGB3_REG_I2C_PERIPH3_REG,
++  // AGB3_REG_I2C_PERIPH3_CTRL,
++  // AGB3_REG_I2C_PERIPH3_DO,
++  // AGB3_REG_I2C_PERIPH4_ADDR,
++  // AGB3_REG_I2C_PERIPH4_REG,
++  // AGB3_REG_I2C_PERIPH4_CTRL,
++  // AGB3_REG_I2C_PERIPH4_DO,
++  // AGB3_REG_I2C_PERIPH4_DI,
++  // 	// Break
++  // AGB3_REG_REG_BANK_SEL = 0x7F,
++
++  // // Magnetometer
++  // M_REG_WIA2 = 0x01,
++  // 	// Break
++  // M_REG_ST1 = 0x10,
++  // M_REG_HXL,
++  // M_REG_HXH,
++  // M_REG_HYL,
++  // M_REG_HYH,
++  // M_REG_HZL,
++  // M_REG_HZH,
++  // M_REG_ST2,
++  // 	// Break
++  // M_REG_CNTL2 = 0x31,
++  // M_REG_CNTL3,
++  // M_REG_TS1,
++  // M_REG_TS2,
++
++#ifdef __cplusplus
++}
++#endif /* __cplusplus */
++
++#endif /* _ICM_20948_ENUMERATIONS_H_ */
+diff --git a/board/project/cockpit/icm20948/ICM_20948_REGISTERS.h b/board/project/cockpit/icm20948/ICM_20948_REGISTERS.h
+new file mode 100644
+index 0000000..fb0e21f
+--- /dev/null
++++ b/board/project/cockpit/icm20948/ICM_20948_REGISTERS.h
+@@ -0,0 +1,810 @@
++/*
++
++This file contains a useful c translation of the datasheet register map
++
++*/
++
++#ifndef _ICM_20948_REGISTERS_H_
++#define _ICM_20948_REGISTERS_H_
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C"
++{
++#endif /* __cplusplus */
++
++  typedef enum
++  {
++    // Generalized
++    REG_BANK_SEL = 0x7F,
++
++    // Gyroscope and Accelerometer
++    // User Bank 0
++    AGB0_REG_WHO_AM_I = 0x00,
++    AGB0_REG_LPF,
++    // Break
++    AGB0_REG_USER_CTRL = 0x03,
++    // Break
++    AGB0_REG_LP_CONFIG = 0x05,
++    AGB0_REG_PWR_MGMT_1,
++    AGB0_REG_PWR_MGMT_2,
++    // Break
++    AGB0_REG_INT_PIN_CONFIG = 0x0F,
++    AGB0_REG_INT_ENABLE,
++    AGB0_REG_INT_ENABLE_1,
++    AGB0_REG_INT_ENABLE_2,
++    AGB0_REG_INT_ENABLE_3,
++    // Break
++    AGB0_REG_I2C_MST_STATUS = 0x17,
++    AGB0_REG_DMP_INT_STATUS,
++    AGB0_REG_INT_STATUS,
++    AGB0_REG_INT_STATUS_1,
++    AGB0_REG_INT_STATUS_2,
++    AGB0_REG_INT_STATUS_3,
++    // Break
++    AGB0_REG_SINGLE_FIFO_PRIORITY_SEL = 0x26,
++    // Break
++    AGB0_REG_DELAY_TIMEH = 0x28,
++    AGB0_REG_DELAY_TIMEL,
++    // Break
++    AGB0_REG_ACCEL_XOUT_H = 0x2D,
++    AGB0_REG_ACCEL_XOUT_L,
++    AGB0_REG_ACCEL_YOUT_H,
++    AGB0_REG_ACCEL_YOUT_L,
++    AGB0_REG_ACCEL_ZOUT_H,
++    AGB0_REG_ACCEL_ZOUT_L,
++    AGB0_REG_GYRO_XOUT_H,
++    AGB0_REG_GYRO_XOUT_L,
++    AGB0_REG_GYRO_YOUT_H,
++    AGB0_REG_GYRO_YOUT_L,
++    AGB0_REG_GYRO_ZOUT_H,
++    AGB0_REG_GYRO_ZOUT_L,
++    AGB0_REG_TEMP_OUT_H,
++    AGB0_REG_TEMP_OUT_L,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_00,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_01,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_02,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_03,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_04,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_05,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_06,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_07,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_08,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_09,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_10,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_11,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_12,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_13,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_14,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_15,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_16,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_17,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_18,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_19,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_20,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_21,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_22,
++    AGB0_REG_EXT_PERIPH_SENS_DATA_23,
++    // Break
++    AGB0_REG_TEMP_CONFIG = 0x53,
++    // Break
++    AGB0_REG_FIFO_EN_1 = 0x66,
++    AGB0_REG_FIFO_EN_2,
++    AGB0_REG_FIFO_RST,
++    AGB0_REG_FIFO_MODE,
++    // Break
++    AGB0_REG_FIFO_COUNT_H = 0x70,
++    AGB0_REG_FIFO_COUNT_L,
++    AGB0_REG_FIFO_R_W,
++    // Break
++    AGB0_REG_DATA_RDY_STATUS = 0x74,
++    AGB0_REG_HW_FIX_DISABLE,
++    AGB0_REG_FIFO_CFG,
++    // Break
++    AGB0_REG_MEM_START_ADDR = 0x7C, // Hmm, Invensense thought they were sneaky not listing these locations on the datasheet...
++    AGB0_REG_MEM_R_W = 0x7D,        // These three locations seem to be able to access some memory within the device
++    AGB0_REG_MEM_BANK_SEL = 0x7E,   // And that location is also where the DMP image gets loaded
++    AGB0_REG_REG_BANK_SEL = 0x7F,
++
++    // Bank 1
++    AGB1_REG_SELF_TEST_X_GYRO = 0x02,
++    AGB1_REG_SELF_TEST_Y_GYRO,
++    AGB1_REG_SELF_TEST_Z_GYRO,
++    // Break
++    AGB1_REG_SELF_TEST_X_ACCEL = 0x0E,
++    AGB1_REG_SELF_TEST_Y_ACCEL,
++    AGB1_REG_SELF_TEST_Z_ACCEL,
++    // Break
++    AGB1_REG_XA_OFFS_H = 0x14,
++    AGB1_REG_XA_OFFS_L,
++    // Break
++    AGB1_REG_YA_OFFS_H = 0x17,
++    AGB1_REG_YA_OFFS_L,
++    // Break
++    AGB1_REG_ZA_OFFS_H = 0x1A,
++    AGB1_REG_ZA_OFFS_L,
++    // Break
++    AGB1_REG_TIMEBASE_CORRECTION_PLL = 0x28,
++    // Break
++    AGB1_REG_REG_BANK_SEL = 0x7F,
++
++    // Bank 2
++    AGB2_REG_GYRO_SMPLRT_DIV = 0x00,
++    AGB2_REG_GYRO_CONFIG_1,
++    AGB2_REG_GYRO_CONFIG_2,
++    AGB2_REG_XG_OFFS_USRH,
++    AGB2_REG_XG_OFFS_USRL,
++    AGB2_REG_YG_OFFS_USRH,
++    AGB2_REG_YG_OFFS_USRL,
++    AGB2_REG_ZG_OFFS_USRH,
++    AGB2_REG_ZG_OFFS_USRL,
++    AGB2_REG_ODR_ALIGN_EN,
++    // Break
++    AGB2_REG_ACCEL_SMPLRT_DIV_1 = 0x10,
++    AGB2_REG_ACCEL_SMPLRT_DIV_2,
++    AGB2_REG_ACCEL_INTEL_CTRL,
++    AGB2_REG_ACCEL_WOM_THR,
++    AGB2_REG_ACCEL_CONFIG,
++    AGB2_REG_ACCEL_CONFIG_2,
++    // Break
++    AGB2_REG_PRS_ODR_CONFIG = 0x20,
++    // Break
++    AGB2_REG_PRGM_START_ADDRH = 0x50,
++    AGB2_REG_PRGM_START_ADDRL,
++    AGB2_REG_FSYNC_CONFIG,
++    AGB2_REG_TEMP_CONFIG,
++    AGB2_REG_MOD_CTRL_USR,
++    // Break
++    AGB2_REG_REG_BANK_SEL = 0x7F,
++
++    // Bank 3
++    AGB3_REG_I2C_MST_ODR_CONFIG = 0x00,
++    AGB3_REG_I2C_MST_CTRL,
++    AGB3_REG_I2C_MST_DELAY_CTRL,
++    AGB3_REG_I2C_PERIPH0_ADDR,
++    AGB3_REG_I2C_PERIPH0_REG,
++    AGB3_REG_I2C_PERIPH0_CTRL,
++    AGB3_REG_I2C_PERIPH0_DO,
++    AGB3_REG_I2C_PERIPH1_ADDR,
++    AGB3_REG_I2C_PERIPH1_REG,
++    AGB3_REG_I2C_PERIPH1_CTRL,
++    AGB3_REG_I2C_PERIPH1_DO,
++    AGB3_REG_I2C_PERIPH2_ADDR,
++    AGB3_REG_I2C_PERIPH2_REG,
++    AGB3_REG_I2C_PERIPH2_CTRL,
++    AGB3_REG_I2C_PERIPH2_DO,
++    AGB3_REG_I2C_PERIPH3_ADDR,
++    AGB3_REG_I2C_PERIPH3_REG,
++    AGB3_REG_I2C_PERIPH3_CTRL,
++    AGB3_REG_I2C_PERIPH3_DO,
++    AGB3_REG_I2C_PERIPH4_ADDR,
++    AGB3_REG_I2C_PERIPH4_REG,
++    AGB3_REG_I2C_PERIPH4_CTRL,
++    AGB3_REG_I2C_PERIPH4_DO,
++    AGB3_REG_I2C_PERIPH4_DI,
++    // Break
++    AGB3_REG_REG_BANK_SEL = 0x7F,
++
++    // Magnetometer
++    M_REG_WIA2 = 0x01,
++    // Break
++    M_REG_ST1 = 0x10,
++    M_REG_HXL,
++    M_REG_HXH,
++    M_REG_HYL,
++    M_REG_HYH,
++    M_REG_HZL,
++    M_REG_HZH,
++    M_REG_ST2,
++    // Break
++    M_REG_CNTL2 = 0x31,
++    M_REG_CNTL3,
++    M_REG_TS1,
++    M_REG_TS2,
++  } ICM_20948_Reg_Addr_e; // These enums are not needed for the user, so they stay in this scope (simplifies naming among other things)
++
++  // Type definitions for the registers
++  typedef struct
++  {
++    uint8_t WHO_AM_I;
++  } ICM_20948_WHO_AM_I_t;
++
++  typedef struct
++  {
++    uint8_t reserved_0 : 1;
++    uint8_t I2C_MST_RST : 1;
++    uint8_t SRAM_RST : 1;
++    uint8_t DMP_RST : 1;
++    uint8_t I2C_IF_DIS : 1;
++    uint8_t I2C_MST_EN : 1;
++    uint8_t FIFO_EN : 1;
++    uint8_t DMP_EN : 1;
++  } ICM_20948_USER_CTRL_t;
++
++  typedef struct
++  {
++    uint8_t reserved_0 : 4;
++    uint8_t GYRO_CYCLE : 1;
++    uint8_t ACCEL_CYCLE : 1;
++    uint8_t I2C_MST_CYCLE : 1;
++    uint8_t reserved_1 : 1;
++  } ICM_20948_LP_CONFIG_t;
++
++  typedef struct
++  {
++    uint8_t CLKSEL : 3;
++    uint8_t TEMP_DIS : 1;
++    uint8_t reserved_0 : 1;
++    uint8_t LP_EN : 1;
++    uint8_t SLEEP : 1;
++    uint8_t DEVICE_RESET : 1;
++  } ICM_20948_PWR_MGMT_1_t;
++
++  typedef struct
++  {
++    uint8_t DISABLE_GYRO : 3;
++    uint8_t DIABLE_ACCEL : 3;
++    uint8_t reserved_0 : 2;
++  } ICM_20948_PWR_MGMT_2_t;
++
++  typedef struct
++  {
++    uint8_t reserved_0 : 1;
++    uint8_t BYPASS_EN : 1;
++    uint8_t FSYNC_INT_MODE_EN : 1;
++    uint8_t ACTL_FSYNC : 1;
++    uint8_t INT_ANYRD_2CLEAR : 1;
++    uint8_t INT1_LATCH_EN : 1;
++    uint8_t INT1_OPEN : 1;
++    uint8_t INT1_ACTL : 1;
++  } ICM_20948_INT_PIN_CFG_t;
++
++  typedef struct
++  {
++    uint8_t I2C_MST_INT_EN : 1;
++    uint8_t DMP_INT1_EN : 1;
++    uint8_t PLL_READY_EN : 1;
++    uint8_t WOM_INT_EN : 1;
++    uint8_t reserved_0 : 3;
++    uint8_t REG_WOF_EN : 1;
++  } ICM_20948_INT_ENABLE_t;
++
++  typedef struct
++  {
++    uint8_t RAW_DATA_0_RDY_EN : 1;
++    uint8_t reserved_0 : 7;
++  } ICM_20948_INT_ENABLE_1_t;
++
++  typedef union
++  {
++    struct
++    {
++      uint8_t FIFO_OVERFLOW_EN_40 : 5;
++      uint8_t reserved_0 : 3;
++    } grouped;
++    struct
++    {
++      uint8_t FIFO_OVERFLOW_EN_0 : 1;
++      uint8_t FIFO_OVERFLOW_EN_1 : 1;
++      uint8_t FIFO_OVERFLOW_EN_2 : 1;
++      uint8_t FIFO_OVERFLOW_EN_3 : 1;
++      uint8_t FIFO_OVERFLOW_EN_4 : 1;
++      uint8_t reserved_0 : 3;
++    } individual;
++  } ICM_20948_INT_ENABLE_2_t;
++
++  // typedef struct{
++  // 	uint8_t FIFO_OVERFLOW_EN_40		: 5;
++  // 	uint8_t reserved_0				: 3;
++  // }ICM_20948_INT_ENABLE_2_t;
++
++  typedef union
++  {
++    struct
++    {
++      uint8_t FIFO_WM_EN_40 : 5;
++      uint8_t reserved_0 : 3;
++    } grouped;
++    struct
++    {
++      uint8_t FIFO_WM_EN_0 : 1;
++      uint8_t FIFO_WM_EN_1 : 1;
++      uint8_t FIFO_WM_EN_2 : 1;
++      uint8_t FIFO_WM_EN_3 : 1;
++      uint8_t FIFO_WM_EN_4 : 1;
++      uint8_t reserved_0 : 3;
++    } individual;
++  } ICM_20948_INT_ENABLE_3_t;
++
++  // typedef struct{
++  // 	uint8_t FIFO_WM_EN_40			: 5;
++  // 	uint8_t reserved_0				: 3;
++  // }ICM_20948_INT_ENABLE_3_t;
++
++  typedef struct
++  {
++    uint8_t I2C_PERIPH0_NACK : 1;
++    uint8_t I2C_PERIPH1_NACK : 1;
++    uint8_t I2C_PERIPH2_NACK : 1;
++    uint8_t I2C_PERIPH3_NACK : 1;
++    uint8_t I2C_PERIPH4_NACK : 1;
++    uint8_t I2C_LOST_ARB : 1;
++    uint8_t I2C_PERIPH4_DONE : 1;
++    uint8_t PASS_THROUGH : 1;
++  } ICM_20948_I2C_MST_STATUS_t;
++
++  typedef struct
++  {
++    uint8_t reserved0 : 1;
++    uint8_t DMP_INT_Motion_Detect_SMD : 1;
++    uint8_t reserved1 : 1;
++    uint8_t DMP_INT_Tilt_Event : 1;
++    uint8_t reserved2 : 4;
++  } ICM_20948_DMP_INT_STATUS_t; // Mostly guesswork from InvenSense App Note
++
++  typedef struct
++  {
++    uint8_t I2C_MST_INT : 1;
++    uint8_t DMP_INT1 : 1;
++    uint8_t PLL_RDY_INT : 1;
++    uint8_t WOM_INT : 1;
++    uint8_t reserved_0 : 4;
++  } ICM_20948_INT_STATUS_t;
++
++  typedef struct
++  {
++    uint8_t RAW_DATA_0_RDY_INT : 1;
++    uint8_t reserved_0 : 7;
++  } ICM_20948_INT_STATUS_1_t;
++
++  // typedef union{
++  // 	struct{
++  // 		uint8_t FIFO_OVERFLOW_INT_40	: 5;
++  // 		uint8_t reserved_0				: 3;
++  // 	}grouped;
++  // 	struct{
++  // 		uint8_t FIFO_OVERFLOW_INT_0 	: 1;
++  // 		uint8_t FIFO_OVERFLOW_INT_1 	: 1;
++  // 		uint8_t FIFO_OVERFLOW_INT_2 	: 1;
++  // 		uint8_t FIFO_OVERFLOW_INT_3 	: 1;
++  // 		uint8_t FIFO_OVERFLOW_INT_4 	: 1;
++  // 		uint8_t reserved_0				: 3;
++  // 	}individual;
++  // }ICM_20948_INT_STATUS_2_t;
++
++  typedef struct
++  {
++    uint8_t FIFO_OVERFLOW_INT_40 : 5;
++    uint8_t reserved_0 : 3;
++  } ICM_20948_INT_STATUS_2_t;
++
++  // typedef union{
++  // 	struct{
++  // 		uint8_t FIFO_WM_INT_40	: 5;
++  // 		uint8_t reserved_0				: 3;
++  // 	}grouped;
++  // 	struct{
++  // 		uint8_t FIFO_WM_INT_0 	: 1;
++  // 		uint8_t FIFO_WM_INT_1 	: 1;
++  // 		uint8_t FIFO_WM_INT_2 	: 1;
++  // 		uint8_t FIFO_WM_INT_3 	: 1;
++  // 		uint8_t FIFO_WM_INT_4 	: 1;
++  // 		uint8_t reserved_0				: 3;
++  // 	}individual;
++  // }ICM_20948_INT_STATUS_3_t;
++
++  typedef struct
++  {
++    uint8_t FIFO_WM_INT40 : 5;
++    uint8_t reserved_0 : 3;
++  } ICM_20948_INT_STATUS_3_t;
++
++  typedef struct
++  {
++    uint8_t DELAY_TIMEH;
++  } ICM_20948_DELAY_TIMEH_t;
++
++  typedef struct
++  {
++    uint8_t DELAY_TIMEL;
++  } ICM_20948_DELAY_TIMEL_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_XOUT_H;
++  } ICM_20948_ACCEL_XOUT_H_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_XOUT_L;
++  } ICM_20948_ACCEL_XOUT_L_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_YOUT_H;
++  } ICM_20948_ACCEL_YOUT_H_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_YOUT_L;
++  } ICM_20948_ACCEL_YOUT_L_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_ZOUT_H;
++  } ICM_20948_ACCEL_ZOUT_H_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_ZOUT_L;
++  } ICM_20948_ACCEL_ZOUT_L_t;
++
++  typedef struct
++  {
++    uint8_t GYRO_XOUT_H;
++  } ICM_20948_GYRO_XOUT_H_t;
++
++  typedef struct
++  {
++    uint8_t GYRO_XOUT_L;
++  } ICM_20948_GYRO_XOUT_L_t;
++
++  typedef struct
++  {
++    uint8_t GYRO_YOUT_H;
++  } ICM_20948_GYRO_YOUT_H_t;
++
++  typedef struct
++  {
++    uint8_t GYRO_YOUT_L;
++  } ICM_20948_GYRO_YOUT_L_t;
++
++  typedef struct
++  {
++    uint8_t GYRO_ZOUT_H;
++  } ICM_20948_GYRO_ZOUT_H_t;
++
++  typedef struct
++  {
++    uint8_t GYRO_ZOUT_L;
++  } ICM_20948_GYRO_ZOUT_L_t;
++
++  typedef struct
++  {
++    uint8_t TEMP_OUT_H;
++  } ICM_20948_TEMP_OUT_H_t;
++
++  typedef struct
++  {
++    uint8_t TEMP_OUT_L;
++  } ICM_20948_TEMP_OUT_L_t;
++
++  typedef struct
++  {
++    uint8_t DATA; // Note: this is not worth copying 24 times, despite there being 24 registers like this one
++  } ICM_20948_EXT_PERIPH_SENS_DATA_t;
++
++  typedef struct
++  {
++    uint8_t PERIPH_0_FIFO_EN : 1;
++    uint8_t PERIPH_1_FIFO_EN : 1;
++    uint8_t PERIPH_2_FIFO_EN : 1;
++    uint8_t PERIPH_3_FIFO_EN : 1;
++    uint8_t reserved_0 : 4;
++  } ICM_20948_FIFO_EN_1_t;
++
++  typedef struct
++  {
++    uint8_t TEMP_FIFO_EN : 1;
++    uint8_t GYRO_X_FIFO_EN : 1;
++    uint8_t GYRO_Y_FIFO_EN : 1;
++    uint8_t GYRO_Z_FIFO_EN : 1;
++    uint8_t ACCEL_FIFO_EN : 1;
++    uint8_t reserved_0 : 3;
++  } ICM_20948_FIFO_EN_2_t;
++
++  typedef struct
++  {
++    uint8_t FIFO_RESET : 5;
++    uint8_t reserved_0 : 3;
++  } ICM_20948_FIFO_RST_t;
++
++  typedef struct
++  {
++    uint8_t FIFO_MODE : 5;
++    uint8_t reserved_0 : 3;
++  } ICM_20948_FIFO_MODE_t;
++
++  typedef struct
++  {
++    uint8_t FIFO_COUNTH;
++  } ICM_20948_FIFO_COUNTH_t;
++
++  typedef struct
++  {
++    uint8_t FIFO_COUNTL;
++  } ICM_20948_FIFO_COUNTL_t;
++
++  typedef struct
++  {
++    uint8_t RAW_DATA_RDY : 4;
++    uint8_t reserved_0 : 3;
++    uint8_t WOF_STATUS : 1;
++  } ICM_20948_DATA_RDY_STATUS_t;
++
++  typedef struct
++  {
++    uint8_t FIFO_CFG : 1;
++    uint8_t reserved_0 : 7;
++  } ICM_20948_FIFO_CFG_t;
++
++  // User bank 1 Types
++
++  typedef struct
++  {
++    uint8_t XG_ST_DATA;
++  } ICM_20948_SELF_TEST_X_GYRO_t;
++
++  typedef struct
++  {
++    uint8_t YG_ST_DATA;
++  } ICM_20948_SELF_TEST_Y_GYRO_t;
++
++  typedef struct
++  {
++    uint8_t ZG_ST_DATA;
++  } ICM_20948_SELF_TEST_Z_GYRO_t;
++
++  typedef struct
++  {
++    uint8_t XA_ST_DATA;
++  } ICM_20948_SELF_TEST_X_ACCEL_t;
++
++  typedef struct
++  {
++    uint8_t YA_ST_DATA;
++  } ICM_20948_SELF_TEST_Y_ACCEL_t;
++
++  typedef struct
++  {
++    uint8_t ZA_ST_DATA;
++  } ICM_20948_SELF_TEST_Z_ACCEL_t;
++
++  typedef struct
++  {
++    uint8_t XA_OFFS_14_7;
++  } ICM_20948_XA_OFFS_H_t;
++
++  typedef struct
++  {
++    uint8_t reserved_0 : 1;
++    uint8_t XA_OFFS_6_0 : 7;
++  } ICM_20948_XA_OFFS_L_t;
++
++  typedef struct
++  {
++    uint8_t YA_OFFS_14_7;
++  } ICM_20948_YA_OFFS_H_t;
++
++  typedef struct
++  {
++    uint8_t reserved_0 : 1;
++    uint8_t YA_OFFS_6_0 : 7;
++  } ICM_20948_YA_OFFS_L_t;
++
++  typedef struct
++  {
++    uint8_t ZA_OFFS_14_7;
++  } ICM_20948_ZA_OFFS_H_t;
++
++  typedef struct
++  {
++    uint8_t reserved_0 : 1;
++    uint8_t ZA_OFFS_6_0 : 7;
++  } ICM_20948_ZA_OFFS_L_t;
++
++  typedef struct
++  {
++    uint8_t TBC_PLL;
++  } ICM_20948_TIMEBASE_CORRECTION_PLL_t;
++
++  // User Bank 2 Types
++  typedef struct
++  {
++    uint8_t GYRO_SMPLRT_DIV;
++  } ICM_20948_GYRO_SMPLRT_DIV_t;
++
++  typedef struct
++  {
++    uint8_t GYRO_FCHOICE : 1;
++    uint8_t GYRO_FS_SEL : 2;
++    uint8_t GYRO_DLPFCFG : 3;
++    uint8_t reserved_0 : 2;
++  } ICM_20948_GYRO_CONFIG_1_t;
++
++  typedef struct
++  {
++    uint8_t GYRO_AVGCFG : 3;
++    uint8_t ZGYRO_CTEN : 1;
++    uint8_t YGYRO_CTEN : 1;
++    uint8_t XGYRO_CTEN : 1;
++    uint8_t reserved_0 : 2;
++  } ICM_20948_GYRO_CONFIG_2_t;
++
++  typedef struct
++  {
++    uint8_t XG_OFFS_USER_H;
++  } ICM_20948_XG_OFFS_USRH_t;
++
++  typedef struct
++  {
++    uint8_t XG_OFFS_USER_L;
++  } ICM_20948_XG_OFFS_USRL_t;
++
++  typedef struct
++  {
++    uint8_t YG_OFFS_USER_H;
++  } ICM_20948_YG_OFFS_USRH_t;
++
++  typedef struct
++  {
++    uint8_t YG_OFFS_USER_L;
++  } ICM_20948_YG_OFFS_USRL_t;
++
++  typedef struct
++  {
++    uint8_t ZG_OFFS_USER_H;
++  } ICM_20948_ZG_OFFS_USRH_t;
++
++  typedef struct
++  {
++    uint8_t ZG_OFFS_USER_L;
++  } ICM_20948_ZG_OFFS_USRL_t;
++
++  typedef struct
++  {
++    uint8_t ODR_ALIGN_EN : 1;
++    uint8_t reserved_0 : 7;
++  } ICM_20948_ODR_ALIGN_EN_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_SMPLRT_DIV_11_8 : 4;
++    uint8_t reserved_0 : 4;
++  } ICM_20948_ACCEL_SMPLRT_DIV_1_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_SMPLRT_DIV_7_0;
++  } ICM_20948_ACCEL_SMPLRT_DIV_2_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_INTEL_MODE_INT : 1;
++    uint8_t ACCEL_INTEL_EN : 1;
++    uint8_t reserved_0 : 6;
++  } ICM_20948_ACCEL_INTEL_CTRL_t;
++
++  typedef struct
++  {
++    uint8_t WOM_THRESHOLD;
++  } ICM_20948_ACCEL_WOM_THR_t;
++
++  typedef struct
++  {
++    uint8_t ACCEL_FCHOICE : 1;
++    uint8_t ACCEL_FS_SEL : 2;
++    uint8_t ACCEL_DLPFCFG : 3;
++    uint8_t reserved_0 : 2;
++  } ICM_20948_ACCEL_CONFIG_t;
++
++  typedef struct
++  {
++    uint8_t DEC3_CFG : 2;
++    uint8_t AZ_ST_EN : 1;
++    uint8_t AY_ST_EN : 1;
++    uint8_t AX_ST_EN : 1;
++    uint8_t reserved_0 : 3;
++  } ICM_20948_ACCEL_CONFIG_2_t;
++
++  typedef struct
++  {
++    uint8_t EXT_SYNC_SET : 4;
++    uint8_t WOF_EDGE_INT : 1;
++    uint8_t WOF_DEGLITCH_EN : 1;
++    uint8_t reserved_0 : 1;
++    uint8_t DELAY_TIME_EN : 1;
++  } ICM_20948_FSYNC_CONFIG_t;
++
++  typedef struct
++  {
++    uint8_t TEMP_DLPFCFG : 3;
++    uint8_t reserved_0 : 5;
++  } ICM_20948_TEMP_CONFIG_t;
++
++  typedef struct
++  {
++    uint8_t REG_LP_DMP_EN : 1;
++    uint8_t reserved_0 : 7;
++  } ICM_20948_MOD_CTRL_USR_t;
++
++  // Bank 3 Types
++
++  typedef struct
++  {
++    uint8_t I2C_MST_ODR_CONFIG : 4;
++    uint8_t reserved_0 : 4;
++  } ICM_20948_I2C_MST_ODR_CONFIG_t;
++
++  typedef struct
++  {
++    uint8_t I2C_MST_CLK : 4;
++    uint8_t I2C_MST_P_NSR : 1;
++    uint8_t reserved_0 : 2;
++    uint8_t MULT_MST_EN : 1;
++  } ICM_20948_I2C_MST_CTRL_t;
++
++  typedef struct
++  {
++    uint8_t I2C_PERIPH0_DELAY_EN : 1;
++    uint8_t I2C_PERIPH1_DELAY_EN : 1;
++    uint8_t I2C_PERIPH2_DELAY_EN : 1;
++    uint8_t I2C_PERIPH3_DELAY_EN : 1;
++    uint8_t I2C_PERIPH4_DELAY_EN : 1;
++    uint8_t reserved_0 : 2;
++    uint8_t DELAY_ES_SHADOW : 1;
++  } ICM_20948_I2C_MST_DELAY_CTRL_t;
++
++  typedef struct
++  {
++    uint8_t ID : 7;
++    uint8_t RNW : 1;
++  } ICM_20948_I2C_PERIPHX_ADDR_t;
++
++  typedef struct
++  {
++    uint8_t REG;
++  } ICM_20948_I2C_PERIPHX_REG_t;
++
++  typedef struct
++  {
++    uint8_t LENG : 4;
++    uint8_t GRP : 1;
++    uint8_t REG_DIS : 1;
++    uint8_t BYTE_SW : 1;
++    uint8_t EN : 1;
++  } ICM_20948_I2C_PERIPHX_CTRL_t;
++
++  typedef struct
++  {
++    uint8_t DO;
++  } ICM_20948_I2C_PERIPHX_DO_t;
++
++  typedef struct
++  {
++    uint8_t DLY : 5;
++    uint8_t REG_DIS : 1;
++    uint8_t INT_EN : 1;
++    uint8_t EN : 1;
++  } ICM_20948_I2C_PERIPH4_CTRL_t;
++
++  typedef struct
++  {
++    uint8_t DI;
++  } ICM_20948_I2C_PERIPH4_DI_t;
++
++  // Bank select register!
++
++  typedef struct
++  {
++    uint8_t reserved_0 : 4;
++    uint8_t USER_BANK : 2;
++    uint8_t reserved_1 : 2;
++  } ICM_20948_REG_BANK_SEL_t;
++
++#ifdef __cplusplus
++}
++#endif /* __cplusplus */
++
++#endif /* _ICM_20948_REGISTERS_H_ */
+diff --git a/board/project/cockpit/icm20948/README.md b/board/project/cockpit/icm20948/README.md
+new file mode 100644
+index 0000000..8374e24
+--- /dev/null
++++ b/board/project/cockpit/icm20948/README.md
+@@ -0,0 +1,44 @@
++# Vendored: SparkFun ICM-20948 portable C core
++
++These files are the platform-independent `src/util/` core from
++SparkFun's `SparkFun_ICM-20948_ArduinoLibrary`
++(https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary),
++copied in unmodified. They implement the register-level protocol for
++the ICM-20948 9-DoF IMU (plus its onboard AK09916 magnetometer) behind
++a small C vtable (`ICM_20948_Serif_t`, see `ICM_20948_C.h`) rather than
++Arduino's `Wire`/`SPI` classes, so they drop into a plain pico-sdk/C
++build without the Arduino wrapper classes (`ICM_20948.cpp/.h`) that
++normally sit on top of them.
++
++`../imu.c` links a `Serif_t` backed by pico-sdk's `hardware_i2c` and
++reimplements the handful of wrapper-class methods RC-Cockpit's
++`imu.cpp` used (`begin`, `startupMagnetometer`, `dataReady`, `getAGMT`,
++`accX/Y/Z`, `gyrX/Y/Z`, `magX/Y/Z`) directly against this core.
++
++DMP (the chip's on-board Digital Motion Processor) support is left
++disabled (`ICM_20948_USE_DMP` is not defined), exactly as in the
++original Arduino sketch - only the raw accelerometer/gyroscope/
++magnetometer path is used, so the large DMP firmware blob that
++`ICM_20948_C.c` would otherwise pull in is never included.
++
++License: SparkFun's code is MIT-licensed (see upstream repo's
++`License.md`); this notice stands in for copying that file verbatim
++into every vendored source file.
++
++  The MIT License (MIT)
++  Copyright (c) 2016 SparkFun Electronics
++  Permission is hereby granted, free of charge, to any person obtaining a copy
++  of this software and associated documentation files (the "Software"), to deal
++  in the Software without restriction, including without limitation the rights
++  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++  copies of the Software, and to permit persons to whom the Software is
++  furnished to do so, subject to the following conditions:
++  The above copyright notice and this permission notice shall be included in all
++  copies or substantial portions of the Software.
++  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++  SOFTWARE.
+diff --git a/board/project/cockpit/imu.c b/board/project/cockpit/imu.c
+new file mode 100644
+index 0000000..d94da48
+--- /dev/null
++++ b/board/project/cockpit/imu.c
+@@ -0,0 +1,350 @@
++/**************************************************************
++ * imu.c - PIMORONI ICM20948 INTERFACE (pico-sdk / RP2350 VERSION)
++ * ============================================================
++ *
++ * Ported from RC-Cockpit's imu.cpp (Arduino, SparkFun ICM_20948
++ * Arduino library) to raw pico-sdk hardware_i2c, talking to the
++ * vendored SparkFun ICM_20948_C core directly (see
++ * icm20948/README.md) instead of through the Arduino wrapper
++ * classes (ICM_20948.cpp/.h), which this build doesn't have.
++ *
++ * Everything that isn't register-level I/O - the complementary
++ * filter for pitch/roll, the tilt-compensated magnetometer
++ * heading, the heading smoothing filter, the slip indicator, the
++ * 180 degree mounting correction, the magnetometer offset
++ * handling - is unchanged from the original, including the German
++ * comments.
++ *************************************************************/
++
++#include "imu.h"
++
++#include <math.h>
++#include <string.h>
++
++#include "compat.h"
++#include "hardware/gpio.h"
++#include "hardware/i2c.h"
++#include "icm20948/AK09916_REGISTERS.h"
++#include "icm20948/ICM_20948_C.h"
++#include "pico/time.h"
++
++/* ====================================================
++ * I2C GLUE (replaces the Arduino Wire-based Serif)
++ * ==================================================== */
++typedef struct {
++    i2c_inst_t *i2c;
++    uint8_t addr;
++} imu_i2c_ctx_t;
++
++static imu_i2c_ctx_t imuI2cCtx;
++static ICM_20948_Serif_t imuSerif;
++static ICM_20948_Device_t icm;
++
++/* RP2350/RP2040 alternate between I2C0 and I2C1 every two GPIOs
++ * (0,1 -> I2C0; 2,3 -> I2C1; 4,5 -> I2C0; 6,7 -> I2C1; ...). */
++static i2c_inst_t *i2c_instance_for_gpio(uint8_t gpio) { return (((gpio / 2) % 2) == 0) ? i2c0 : i2c1; }
++
++static ICM_20948_Status_e icm_i2c_write(uint8_t regaddr, uint8_t *pdata, uint32_t len, void *user) {
++    imu_i2c_ctx_t *ctx = (imu_i2c_ctx_t *)user;
++    if (ctx == NULL || len > INV_MAX_SERIAL_WRITE) return ICM_20948_Stat_ParamErr;
++
++    uint8_t buf[1 + INV_MAX_SERIAL_WRITE];
++    buf[0] = regaddr;
++    memcpy(&buf[1], pdata, len);
++
++    int ret = i2c_write_blocking(ctx->i2c, ctx->addr, buf, (size_t)(len + 1), false);
++    return (ret == (int)(len + 1)) ? ICM_20948_Stat_Ok : ICM_20948_Stat_Err;
++}
++
++static ICM_20948_Status_e icm_i2c_read(uint8_t regaddr, uint8_t *pdata, uint32_t len, void *user) {
++    imu_i2c_ctx_t *ctx = (imu_i2c_ctx_t *)user;
++    if (ctx == NULL) return ICM_20948_Stat_ParamErr;
++
++    int wret = i2c_write_blocking(ctx->i2c, ctx->addr, &regaddr, 1, true); /* repeated start */
++    if (wret != 1) return ICM_20948_Stat_Err;
++
++    int rret = i2c_read_blocking(ctx->i2c, ctx->addr, pdata, (size_t)len, false);
++    return (rret == (int)len) ? ICM_20948_Stat_Ok : ICM_20948_Stat_NoData;
++}
++
++/* ====================================================
++ * SENSOR-WERTE (AKTUELL)
++ * ==================================================== */
++static float gPitch = 0.0f;
++static float gRoll = 0.0f;
++static int gHeading = 0;
++static float gSlip = 0.0f;
++
++/* Letztes AGMT-Sample (fuer die Skalierungsfunktionen unten,
++ * wie agmt in der Arduino-Wrapper-Klasse). */
++static ICM_20948_AGMT_t agmt;
++
++/* ====================================================
++ * COMPLEMENTARY FILTER (Pitch/Roll)
++ * ==================================================== */
++static const float ALPHA = 0.98f;
++static uint32_t lastUpdateTimeMs = 0;
++
++/* ====================================================
++ * MAGNETOMETER KALIBRIERUNG
++ * ==================================================== */
++static float magOffsetX = 0.0f;
++static float magOffsetY = 0.0f;
++static float magOffsetZ = 0.0f;
++
++/* ====================================================
++ * HEADING FILTER (fuer sanfte 0/360 Grad Uebergaenge)
++ * ==================================================== */
++static float headingFiltered = 0.0f;
++static const float HEADING_ALPHA = 0.85f;
++
++/* ====================================================
++ * HILFSFUNKTIONEN
++ * ==================================================== */
++static int wrapHeading(int h) {
++    while (h < 0) h += 360;
++    while (h >= 360) h -= 360;
++    return h;
++}
++
++/* ====================================================
++ * TILT-KOMPENSIERTES HEADING
++ * ==================================================== */
++static float getTiltCompensatedHeading(float magX, float magY, float magZ, float pitch, float roll) {
++    float pitchRad = pitch * DEG_TO_RAD;
++    float rollRad = roll * DEG_TO_RAD;
++
++    float cosPitch = cosf(pitchRad);
++    float sinPitch = sinf(pitchRad);
++    float cosRoll = cosf(rollRad);
++    float sinRoll = sinf(rollRad);
++
++    float Xh = magX * cosPitch + magZ * sinPitch;
++    float Yh = magX * sinRoll * sinPitch + magY * cosRoll - magZ * sinRoll * cosPitch;
++
++    float heading = atan2f(Yh, Xh) * RAD_TO_DEG;
++
++    if (heading < 0) heading += 360.0f;
++
++    return heading;
++}
++
++/* ====================================================
++ * SKALIERUNG (ersetzt ICM_20948::accX/gyrX/magX, die in der
++ * Arduino-Wrapper-Klasse sitzen - nicht im C-Core).
++ * ==================================================== */
++static float getAccMG(int16_t axis_val) {
++    switch (agmt.fss.a) {
++        case 0:
++            return ((float)axis_val) / 16.384f;
++        case 1:
++            return ((float)axis_val) / 8.192f;
++        case 2:
++            return ((float)axis_val) / 4.096f;
++        case 3:
++            return ((float)axis_val) / 2.048f;
++        default:
++            return 0;
++    }
++}
++
++static float getGyrDPS(int16_t axis_val) {
++    switch (agmt.fss.g) {
++        case 0:
++            return ((float)axis_val) / 131.0f;
++        case 1:
++            return ((float)axis_val) / 65.5f;
++        case 2:
++            return ((float)axis_val) / 32.8f;
++        case 3:
++            return ((float)axis_val) / 16.4f;
++        default:
++            return 0;
++    }
++}
++
++static float getMagUT(int16_t axis_val) { return ((float)axis_val) * 0.15f; }
++
++/* ====================================================
++ * MAGNETOMETER STARTUP (ersetzt ICM_20948::startupMagnetometer)
++ * ==================================================== */
++static bool imuStartupMagnetometer(void) {
++    ICM_20948_i2c_master_passthrough(&icm, false); /* SDA/SCL nicht an AUX_DA/AUX_CL durchreichen */
++    ICM_20948_i2c_master_enable(&icm, true);
++
++    uint8_t srst = 1;
++    ICM_20948_i2c_master_single_w(&icm, MAG_AK09916_I2C_ADDR, AK09916_REG_CNTL3, &srst);
++
++    /* Nach einem ICM-Reset reagiert der Mag-Sensor ueber den I2C-Master
++     * manchmal erst nach ein paar Versuchen - Master-I2C zuruecksetzen
++     * und erneut probieren, bis die WhoAmI-Register stimmen. */
++    const int MAX_MAGNETOMETER_STARTS = 10;
++    bool found = false;
++    for (int tries = 0; tries < MAX_MAGNETOMETER_STARTS; tries++) {
++        uint8_t wia1 = 0, wia2 = 0;
++        ICM_20948_i2c_master_single_r(&icm, MAG_AK09916_I2C_ADDR, AK09916_REG_WIA1, &wia1);
++        ICM_20948_i2c_master_single_r(&icm, MAG_AK09916_I2C_ADDR, AK09916_REG_WIA2, &wia2);
++
++        if (wia1 == (uint8_t)(MAG_AK09916_WHO_AM_I >> 8) && wia2 == (uint8_t)(MAG_AK09916_WHO_AM_I & 0xFF)) {
++            found = true;
++            break;
++        }
++
++        ICM_20948_i2c_master_reset(&icm);
++        sleep_ms(10);
++    }
++
++    if (!found) {
++        debug("\nIMU: Magnetometer (AK09916) WhoAmI nicht erkannt");
++        return false;
++    }
++
++    AK09916_CNTL2_Reg_t reg;
++    reg.MODE = AK09916_mode_cont_100hz;
++    reg.reserved_0 = 0;
++    ICM_20948_i2c_master_single_w(&icm, MAG_AK09916_I2C_ADDR, AK09916_REG_CNTL2, (uint8_t *)&reg);
++
++    /* Peripheral 0 liest fortlaufend ST1+HXL..HZH+ST2 (9 Byte) aus dem
++     * Magnetometer und legt sie in die EXT_SLV_SENS_DATA-Register, wo
++     * ICM_20948_get_agmt() sie mit abholt - exakt wie im Original. */
++    ICM_20948_i2c_controller_configure_peripheral(&icm, 0, MAG_AK09916_I2C_ADDR, AK09916_REG_ST1, 9, true, true, false,
++                                                   false, false, 0);
++
++    return true;
++}
++
++/* ====================================================
++ * INITIALISIERUNG
++ * ==================================================== */
++bool imuBegin(uint8_t pinSDA, uint8_t pinSCL) {
++    debug("\nIMU: Initialisierung (pico-sdk)");
++
++    imuI2cCtx.i2c = i2c_instance_for_gpio(pinSDA);
++    imuI2cCtx.addr = ICM_20948_I2C_ADDR_AD0;
++
++    i2c_init(imuI2cCtx.i2c, 400 * 1000);
++    gpio_set_function(pinSDA, GPIO_FUNC_I2C);
++    gpio_set_function(pinSCL, GPIO_FUNC_I2C);
++    gpio_pull_up(pinSDA);
++    gpio_pull_up(pinSCL);
++    sleep_ms(100);
++
++    ICM_20948_init_struct(&icm);
++    imuSerif.write = icm_i2c_write;
++    imuSerif.read = icm_i2c_read;
++    imuSerif.user = &imuI2cCtx;
++    ICM_20948_link_serif(&icm, &imuSerif);
++
++    /* Adresse 0x68 (Standard) versuchen, sonst 0x69 */
++    if (ICM_20948_check_id(&icm) != ICM_20948_Stat_Ok) {
++        imuI2cCtx.addr = ICM_20948_I2C_ADDR_AD1;
++        if (ICM_20948_check_id(&icm) != ICM_20948_Stat_Ok) {
++            debug("\nIMU: FEHLER - ICM-20948 nicht gefunden!");
++            return false;
++        }
++    }
++    debug("\nIMU: ICM-20948 verbunden");
++
++    if (ICM_20948_sw_reset(&icm) != ICM_20948_Stat_Ok) {
++        debug("\nIMU: FEHLER - swReset fehlgeschlagen");
++        return false;
++    }
++    sleep_ms(50);
++
++    ICM_20948_sleep(&icm, false);
++    ICM_20948_low_power(&icm, false);
++
++    if (!imuStartupMagnetometer()) {
++        debug("\nIMU: WARNUNG - Magnetometer-Init fehlgeschlagen");
++    } else {
++        debug("\nIMU: Magnetometer aktiviert");
++    }
++
++    ICM_20948_set_sample_mode(&icm, (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), ICM_20948_Sample_Mode_Continuous);
++
++    ICM_20948_fss_t fss;
++    fss.a = gpm2;
++    fss.g = dps250;
++    fss.reserved_0 = 0;
++    ICM_20948_set_full_scale(&icm, (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), fss);
++
++    ICM_20948_dlpcfg_t dlpcfg;
++    dlpcfg.a = acc_d473bw_n499bw;
++    dlpcfg.g = gyr_d361bw4_n376bw5;
++    ICM_20948_set_dlpf_cfg(&icm, (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), dlpcfg);
++
++    ICM_20948_enable_dlpf(&icm, ICM_20948_Internal_Acc, false);
++    ICM_20948_enable_dlpf(&icm, ICM_20948_Internal_Gyr, false);
++
++    lastUpdateTimeMs = to_ms_since_boot(get_absolute_time());
++
++    debug("\nIMU: bereit");
++    return true;
++}
++
++/* ====================================================
++ * UPDATE (SENSOR-FUSION)
++ * ==================================================== */
++void imuUpdate(void) {
++    if (ICM_20948_data_ready(&icm) != ICM_20948_Stat_Ok) {
++        return;
++    }
++
++    ICM_20948_get_agmt(&icm, &agmt);
++
++    /* -------- Zeit-Delta -------- */
++    uint32_t now = to_ms_since_boot(get_absolute_time());
++    float dt = (now - lastUpdateTimeMs) / 1000.0f;
++    lastUpdateTimeMs = now;
++
++    /* -------- Sensor-Daten (180 Grad Montage-Korrektur) -------- */
++    float ax = -getAccMG(agmt.acc.axes.x);
++    float ay = getAccMG(agmt.acc.axes.y); /* NICHT negieren - sonst ist Pitch invertiert! */
++    float az = -getAccMG(agmt.acc.axes.z);
++
++    float gx = -getGyrDPS(agmt.gyr.axes.x);
++    float gy = getGyrDPS(agmt.gyr.axes.y); /* NICHT negieren - sonst ist Pitch invertiert! */
++    float gz = -getGyrDPS(agmt.gyr.axes.z);
++
++    float mx = -getMagUT(agmt.mag.axes.x) - magOffsetX;
++    float my = -getMagUT(agmt.mag.axes.y) - magOffsetY;
++    float mz = -getMagUT(agmt.mag.axes.z) - magOffsetZ;
++
++    /* -------- Pitch/Roll aus Beschleunigung -------- */
++    float pitchAcc = atan2f(ay, sqrtf(ax * ax + az * az)) * RAD_TO_DEG;
++    float rollAcc = atan2f(-ax, az) * RAD_TO_DEG;
++
++    /* -------- Pitch/Roll aus Gyro (Integration) -------- */
++    float pitchGyro = gPitch + gy * dt;
++    float rollGyro = gRoll + gx * dt;
++
++    /* -------- Complementary Filter -------- */
++    gPitch = ALPHA * pitchGyro + (1.0f - ALPHA) * pitchAcc;
++    gRoll = ALPHA * rollGyro + (1.0f - ALPHA) * rollAcc;
++
++    /* -------- Tilt-kompensiertes Heading -------- */
++    float heading = getTiltCompensatedHeading(mx, my, mz, gPitch, gRoll);
++
++    /* -------- Heading Filter (sanfte 0/360 Grad Uebergaenge) -------- */
++    float delta = heading - headingFiltered;
++    if (delta > 180.0f) delta -= 360.0f;
++    if (delta < -180.0f) delta += 360.0f;
++
++    headingFiltered += delta * (1.0f - HEADING_ALPHA);
++    if (headingFiltered < 0) headingFiltered += 360.0f;
++    if (headingFiltered >= 360.0f) headingFiltered -= 360.0f;
++
++    gHeading = (int)(headingFiltered + 0.5f);
++    gHeading = wrapHeading(gHeading);
++
++    /* -------- Slip Indikator -------- */
++    gSlip = constrain(gz / 100.0f, -1.0f, 1.0f);
++}
++
++/* ====================================================
++ * GETTER
++ * ==================================================== */
++float imuGetPitch(void) { return gPitch; }
++float imuGetRoll(void) { return gRoll; }
++int imuGetHeading(void) { return gHeading; }
++float imuGetSlip(void) { return gSlip; }
+diff --git a/board/project/cockpit/imu.h b/board/project/cockpit/imu.h
+new file mode 100644
+index 0000000..56df751
+--- /dev/null
++++ b/board/project/cockpit/imu.h
+@@ -0,0 +1,58 @@
++#ifndef COCKPIT_IMU_H
++#define COCKPIT_IMU_H
++
++/**************************************************************
++ * imu.h - PIMORONI ICM20948 INTERFACE (pico-sdk / RP2350 port)
++ * ============================================================
++ *
++ * Ported from RC-Cockpit's imu.cpp/.h (Arduino, SparkFun ICM_20948
++ * Arduino library) to raw pico-sdk hardware_i2c + the vendored
++ * SparkFun ICM_20948_C core in icm20948/ (see icm20948/README.md).
++ * The sensor-fusion math itself (complementary filter for pitch/
++ * roll, tilt-compensated magnetometer heading, slip indicator) is
++ * unchanged from the original.
++ *
++ * HARDWARE:
++ * - Pimoroni ICM20948 9DoF (PIM448)
++ * - Montage: 180 Grad gedreht, Z-Achse nach oben
++ *
++ * OUTPUT:
++ * - Pitch:   -90 .. +90 Grad (Nase hoch = positiv)
++ * - Roll:    -180 .. +180 Grad (rechts = positiv)
++ * - Heading: 0 .. 360 Grad (Nord = 0, im Uhrzeigersinn)
++ * - Slip:    -1.0 .. +1.0 (normiert)
++ *
++ * VERWENDUNG:
++ *   imuBegin(PIN_IMU_SDA, PIN_IMU_SCL);  // Einmalig beim Start
++ *   imuUpdate();                        // Zyklisch pro Frame
++ *
++ *   float pitch = imuGetPitch();
++ *   float roll = imuGetRoll();
++ *   int heading = imuGetHeading();
++ *   float slip = imuGetSlip();
++ *************************************************************/
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "common.h"
++
++extern context_t context;
++
++#define COCKPIT_PIN_IMU_SDA 4 /* blau */
++#define COCKPIT_PIN_IMU_SCL 5 /* gelb */
++
++/* Initialisiert I2C-Bus und ICM-20948 (inkl. Magnetometer).
++ * Gibt false zurueck, wenn der Sensor nicht gefunden wurde. */
++bool imuBegin(uint8_t pinSDA, uint8_t pinSCL);
++
++/* Liest Sensoren und aktualisiert den Komplementaerfilter. Muss
++ * regelmaessig aufgerufen werden (50-200 Hz). */
++void imuUpdate(void);
++
++float imuGetPitch(void);
++float imuGetRoll(void);
++int imuGetHeading(void);
++float imuGetSlip(void);
++
++#endif /* COCKPIT_IMU_H */
+-- 
+2.43.0
+

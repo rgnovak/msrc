@@ -1,0 +1,141 @@
+From 2486ad5465c6ac687019f5d8c6439b929ddd5582 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 16:28:06 +0200
+Subject: [PATCH] Centralize cockpit GPIO pin assignments in cockpit_pins.h
+
+Display, pilot-head servo, and IMU pin numbers used to be #defined
+separately in display.h/piloten.h/imu.h. Pull them all into one new
+header, cockpit_pins.h, mirroring the pattern constants.h already
+uses for MSRC's own receiver/sensor pins - one place to check or
+change a pin before rebuilding, nothing else hardcodes a number.
+
+Also documents, as comments, which of these pins numerically overlap
+with constants.h's defaults for other MSRC features (vario I2C, GPS
+UART, ESC telemetry UART, fuel meter, smart-ESC PWM) - only a real
+conflict if a given build also enables one of those, but worth
+knowing before wiring/flashing a chip that runs both.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Rfc6e49BcxsziTxc1evta1
+---
+ board/project/cockpit/cockpit_pins.h | 46 ++++++++++++++++++++++++++++
+ board/project/cockpit/display.h      | 12 ++------
+ board/project/cockpit/imu.h          |  4 +--
+ board/project/cockpit/piloten.h      |  2 +-
+ 4 files changed, 51 insertions(+), 13 deletions(-)
+ create mode 100644 board/project/cockpit/cockpit_pins.h
+
+diff --git a/board/project/cockpit/cockpit_pins.h b/board/project/cockpit/cockpit_pins.h
+new file mode 100644
+index 0000000..83d55a7
+--- /dev/null
++++ b/board/project/cockpit/cockpit_pins.h
+@@ -0,0 +1,46 @@
++#ifndef COCKPIT_PINS_H
++#define COCKPIT_PINS_H
++
++/* Single place for every GPIO the cockpit extension (both displays,
++ * the pilot-head gaze servo, the IMU) uses on the Core2350B. Change
++ * a pin here and rebuild - nothing else under cockpit/ hardcodes a
++ * pin number anymore. This mirrors board/project/constants.h, which
++ * does the same job for MSRC's own receiver/sensor pins.
++ *
++ * These pins aren't a free choice we made - they come from the
++ * Core2350B's fixed display/IMU/servo wiring, inherited from the
++ * original Arduino sketch. Several of them happen to share a GPIO
++ * number with one of constants.h's defaults for a DIFFERENT MSRC
++ * feature (vario, GPS, ESC telemetry, ...). That's only a real
++ * conflict on a build that also enables that feature; known
++ * overlaps as of this writing:
++ *   GPIO 4/5  - also UART1_TX/RX_GPIO (ESC telemetry UART),
++ *               PWM_CAPTURE_GPIO / CASTLE_PWM_GPIO / CASTLE_ESC_GPIO
++ *   GPIO 6    - also UART_RX_PIO_GPIO (GPS tx)
++ *   GPIO 7    - also CLOCK_STRETCH_GPIO (npn switch)
++ *   GPIO 8/9  - also I2C0_SDA/SCL_GPIO (vario)
++ *   GPIO 12   - also SMART_ESC_PWM_GPIO
++ *   GPIO 14   - also UART_TX_PIO_GPIO (GPS rx)
++ *   GPIO 15   - also RESTORE_GPIO (config-reset button)
++ * If this particular chip ever also runs one of those MSRC features,
++ * move THAT feature's pin in constants.h rather than a cockpit pin
++ * here - the display/servo/IMU wiring is fixed on the board. */
++
++/* ---- Displays (2x ST7735, shared SPI0) ---- */
++#define COCKPIT_PIN_SPI_SCK 6
++#define COCKPIT_PIN_SPI_MOSI 7
++#define COCKPIT_PIN_CS1 8   // Display 1 - PFD
++#define COCKPIT_PIN_CS2 9   // Display 2 - Moving Map
++#define COCKPIT_PIN_DC 12
++#define COCKPIT_PIN_RST 13
++#define COCKPIT_PIN_BL1 14
++#define COCKPIT_PIN_BL2 15
++
++/* ---- Pilot-head gaze servo ---- */
++#define COCKPIT_PIN_PILOT_SERVO 21
++
++/* ---- IMU (ICM-20948, I2C) ---- */
++#define COCKPIT_PIN_IMU_SDA 4 /* blau */
++#define COCKPIT_PIN_IMU_SCL 5 /* gelb */
++
++#endif /* COCKPIT_PINS_H */
+diff --git a/board/project/cockpit/display.h b/board/project/cockpit/display.h
+index 89c3456..5c1454e 100644
+--- a/board/project/cockpit/display.h
++++ b/board/project/cockpit/display.h
+@@ -14,19 +14,13 @@
+  * the panelColor()/raw-framebuffer-push byte order in pfd.h/pfd.c all
+  * come from that working build. Pin numbers here are for the
+  * Core2350B 2-display board (same SPI/DC/RST/backlight pins, just
+- * CS1/CS2 instead of CS1..CS4). */
++ * CS1/CS2 instead of CS1..CS4) - see cockpit_pins.h, the single place
++ * that now defines them. */
+ 
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+-#define COCKPIT_PIN_SPI_SCK 6
+-#define COCKPIT_PIN_SPI_MOSI 7
+-#define COCKPIT_PIN_CS1 8   // Display 1 - PFD
+-#define COCKPIT_PIN_CS2 9   // Display 2 - Moving Map
+-#define COCKPIT_PIN_DC 12
+-#define COCKPIT_PIN_RST 13
+-#define COCKPIT_PIN_BL1 14
+-#define COCKPIT_PIN_BL2 15
++#include "cockpit_pins.h"
+ 
+ /* Brings up SPI0 + both ST7735 panels, clears them to black, turns
+  * the backlights on, and allocates the two framebuffers (frontFB/
+diff --git a/board/project/cockpit/imu.h b/board/project/cockpit/imu.h
+index 56df751..36e55c3 100644
+--- a/board/project/cockpit/imu.h
++++ b/board/project/cockpit/imu.h
+@@ -35,13 +35,11 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
++#include "cockpit_pins.h" /* COCKPIT_PIN_IMU_SDA / _SCL */
+ #include "common.h"
+ 
+ extern context_t context;
+ 
+-#define COCKPIT_PIN_IMU_SDA 4 /* blau */
+-#define COCKPIT_PIN_IMU_SCL 5 /* gelb */
+-
+ /* Initialisiert I2C-Bus und ICM-20948 (inkl. Magnetometer).
+  * Gibt false zurueck, wenn der Sensor nicht gefunden wurde. */
+ bool imuBegin(uint8_t pinSDA, uint8_t pinSCL);
+diff --git a/board/project/cockpit/piloten.h b/board/project/cockpit/piloten.h
+index f1be13a..b531d02 100644
+--- a/board/project/cockpit/piloten.h
++++ b/board/project/cockpit/piloten.h
+@@ -16,7 +16,7 @@
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+-#define COCKPIT_PIN_PILOT_SERVO 21
++#include "cockpit_pins.h" /* COCKPIT_PIN_PILOT_SERVO */
+ 
+ void pilotenBegin(uint8_t gpio);
+ void pilotenUpdate(void);
+-- 
+2.43.0
+

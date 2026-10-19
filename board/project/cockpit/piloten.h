@@ -16,7 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define COCKPIT_PIN_PILOT_SERVO 21
+#include "cockpit_pins.h" /* COCKPIT_PIN_PILOT_SERVO */
 
 void pilotenBegin(uint8_t gpio);
 void pilotenUpdate(void);

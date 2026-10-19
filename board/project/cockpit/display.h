@@ -14,19 +14,13 @@
  * the panelColor()/raw-framebuffer-push byte order in pfd.h/pfd.c all
  * come from that working build. Pin numbers here are for the
  * Core2350B 2-display board (same SPI/DC/RST/backlight pins, just
- * CS1/CS2 instead of CS1..CS4). */
+ * CS1/CS2 instead of CS1..CS4) - see cockpit_pins.h, the single place
+ * that now defines them. */
 
 #include <stdbool.h>
 #include <stdint.h>
 
-#define COCKPIT_PIN_SPI_SCK 6
-#define COCKPIT_PIN_SPI_MOSI 7
-#define COCKPIT_PIN_CS1 8   // Display 1 - PFD
-#define COCKPIT_PIN_CS2 9   // Display 2 - Moving Map
-#define COCKPIT_PIN_DC 12
-#define COCKPIT_PIN_RST 13
-#define COCKPIT_PIN_BL1 14
-#define COCKPIT_PIN_BL2 15
+#include "cockpit_pins.h"
 
 /* Brings up SPI0 + both ST7735 panels, clears them to black, turns
  * the backlights on, and allocates the two framebuffers (frontFB/

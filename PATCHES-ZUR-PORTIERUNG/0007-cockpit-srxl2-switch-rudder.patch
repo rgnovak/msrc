@@ -1,0 +1,501 @@
+From 81675aa1bc285ef42616aed9ca8bb334b2c1acf6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 15:46:22 +0200
+Subject: [PATCH] Replace cockpit's PWM switch input with SRXL2, couple pilot
+ head to rudder
+
+cockpit_switch.c replaces the original Arduino sketch's pwm_input.cpp:
+same 3-zone hysteresis classification (LOW/CENTER/HIGH) and the same
+signal-loss fail-safe, but reading a channel MSRC already decodes out
+of the SRXL2 stream (srxl2_channels.c) instead of measuring a PWM
+pulse on a dedicated GPIO. Which channel is the switch, and which is
+the rudder, are both single #defines in the new cockpit_channels.h
+so they're easy to change later.
+
+cockpit_task now carries the toggle behavior that consumed
+pwm_input's zones in the original .ino, which this port hadn't had
+at all until now: switching to HIGH toggles the pilot head's
+movement on/off, switching to LOW toggles both displays (backlight)
+on/off, CENTER itself does nothing, and losing the SRXL2 link forces
+both back on as a fail-safe. Displays and head movement both start
+off at boot; the Garmin bootscreen is shown once, the first time the
+displays are switched on, never again after that, held non-blocking
+via a timestamp instead of vTaskDelay so the servo/IMU keep updating
+while it's shown.
+
+piloten.c gains pilotenSetRudder()/a rudder bias (on top of the
+existing roll bias, same architecture) and pilotenSetEnabled()/
+pilotenGetEnabled() for the head-movement toggle, porting the
+Enabled/parking logic from the newer single-servo piloten.cpp Ralph
+sent along with the switch-channel and rudder-channel answers.
+
+Channel numbers (switch = 5, rudder = 4) and the rudder bias sign
+are reasonable defaults/assumptions - see the comments in
+cockpit_channels.h and piloten.c's rudderBias() - flagged for
+Ralph to confirm once hardware is in hand.
+---
+ board/project/cockpit/CMakeLists.txt     |   1 +
+ board/project/cockpit/cockpit_channels.h |  25 +++++
+ board/project/cockpit/cockpit_switch.c   |  70 ++++++++++++
+ board/project/cockpit/cockpit_switch.h   |  32 ++++++
+ board/project/cockpit/cockpit_task.c     | 132 ++++++++++++++++++++---
+ board/project/cockpit/piloten.c          |  46 +++++++-
+ board/project/cockpit/piloten.h          |  16 ++-
+ 7 files changed, 303 insertions(+), 19 deletions(-)
+ create mode 100644 board/project/cockpit/cockpit_channels.h
+ create mode 100644 board/project/cockpit/cockpit_switch.c
+ create mode 100644 board/project/cockpit/cockpit_switch.h
+
+diff --git a/board/project/cockpit/CMakeLists.txt b/board/project/cockpit/CMakeLists.txt
+index 95e0b73..d278366 100644
+--- a/board/project/cockpit/CMakeLists.txt
++++ b/board/project/cockpit/CMakeLists.txt
+@@ -4,6 +4,7 @@ target_sources(${PROJECT_NAME} PRIVATE
+     map.c
+     bootscreen.c
+     cockpit_task.c
++    cockpit_switch.c
+     piloten.c
+     imu.c
+     icm20948/ICM_20948_C.c
+diff --git a/board/project/cockpit/cockpit_channels.h b/board/project/cockpit/cockpit_channels.h
+new file mode 100644
+index 0000000..6e99bb1
+--- /dev/null
++++ b/board/project/cockpit/cockpit_channels.h
+@@ -0,0 +1,25 @@
++#ifndef COCKPIT_CHANNELS_H
++#define COCKPIT_CHANNELS_H
++
++/* SRXL2 channel assignment for the cockpit's RC inputs, numbered the
++ * same way the transmitter/receiver shows them (1-indexed) - just
++ * change these two lines if the switch or the rudder end up on a
++ * different channel on your transmitter, nothing else needs to
++ * know about it.
++ *
++ * COCKPIT_CH_SWITCH: the 3-position switch that used to be read
++ * over a dedicated PWM wire (pwm_input.cpp) - now read as an SRXL2
++ * channel instead, same toggle behavior (see cockpit_switch.h).
++ * Channel 5 per Ralph: free on the Rockstar since it has no
++ * retractable gear.
++ *
++ * COCKPIT_CH_RUDDER: fed into the pilot head's gaze servo as an
++ * extra look-bias (see piloten.h's pilotenSetRudder()). Channel 4
++ * matches Ralph's own channel convention on the ix14+SE/AR10360T+
++ * (K4 = Seitenruder, per the A320 setup) - not yet confirmed for
++ * the Rockstar specifically, so double-check once the transmitter
++ * is in front of you. */
++#define COCKPIT_CH_SWITCH 5
++#define COCKPIT_CH_RUDDER 4
++
++#endif /* COCKPIT_CHANNELS_H */
+diff --git a/board/project/cockpit/cockpit_switch.c b/board/project/cockpit/cockpit_switch.c
+new file mode 100644
+index 0000000..589b9df
+--- /dev/null
++++ b/board/project/cockpit/cockpit_switch.c
+@@ -0,0 +1,70 @@
++#include "cockpit_switch.h"
++
++#include "cockpit_channels.h"
++#include "pico/time.h"
++#include "srxl2_channels.h"
++
++/* Same zone thresholds as the original pwm_input.cpp, in the
++ * microsecond-equivalent units srxl2_channel_to_us() returns
++ * (~988..2012us, center 1500us - the same convention a standard RC
++ * PWM pulse uses, which is exactly why pwm_input's thresholds carry
++ * over unchanged). */
++static const float LOW_ENTER = 1300.0f;   /* < 1300us  -> LOW */
++static const float LOW_EXIT = 1350.0f;    /* > 1350us  -> back toward CENTER */
++static const float HIGH_ENTER = 1700.0f;  /* > 1700us  -> HIGH */
++static const float HIGH_EXIT = 1650.0f;   /* < 1650us  -> back toward CENTER */
++
++/* No new SRXL2 Control frame for this long -> treat the link as
++ * lost and fall back to CENTER, same idea as pwm_input's 250ms PWM
++ * signal timeout (there measured between pulse edges, here between
++ * parsed frames). */
++static const uint32_t SIGNAL_TIMEOUT_MS = 250;
++
++static cockpit_switch_zone_t currentZone = COCKPIT_SWITCH_CENTER;
++static bool signalPresent = false;
++static bool haveSeenAnyFrame = false;
++static uint32_t lastFrameCountSeen = 0;
++static uint32_t lastFrameSeenMs = 0;
++
++void cockpitSwitchUpdate(void) {
++    srxl2_channels_t ch;
++    srxl2_channels_get(&ch);
++
++    uint32_t now = to_ms_since_boot(get_absolute_time());
++
++    if (ch.frame_count != lastFrameCountSeen) {
++        lastFrameCountSeen = ch.frame_count;
++        lastFrameSeenMs = now;
++        haveSeenAnyFrame = true;
++    }
++
++    bool channelKnown = (ch.mask & (1u << (COCKPIT_CH_SWITCH - 1))) != 0;
++    bool frameRecent = haveSeenAnyFrame && (now - lastFrameSeenMs) <= SIGNAL_TIMEOUT_MS;
++    signalPresent = frameRecent && channelKnown;
++
++    if (!signalPresent) {
++        currentZone = COCKPIT_SWITCH_CENTER;
++        return;
++    }
++
++    float us = srxl2_channel_to_us(ch.raw[COCKPIT_CH_SWITCH - 1]);
++
++    switch (currentZone) {
++        case COCKPIT_SWITCH_CENTER:
++            if (us < LOW_ENTER)
++                currentZone = COCKPIT_SWITCH_LOW;
++            else if (us > HIGH_ENTER)
++                currentZone = COCKPIT_SWITCH_HIGH;
++            break;
++        case COCKPIT_SWITCH_LOW:
++            if (us > LOW_EXIT) currentZone = COCKPIT_SWITCH_CENTER;
++            break;
++        case COCKPIT_SWITCH_HIGH:
++            if (us < HIGH_EXIT) currentZone = COCKPIT_SWITCH_CENTER;
++            break;
++    }
++}
++
++cockpit_switch_zone_t cockpitSwitchGetZone(void) { return currentZone; }
++
++bool cockpitSwitchSignalPresent(void) { return signalPresent; }
+diff --git a/board/project/cockpit/cockpit_switch.h b/board/project/cockpit/cockpit_switch.h
+new file mode 100644
+index 0000000..0b72787
+--- /dev/null
++++ b/board/project/cockpit/cockpit_switch.h
+@@ -0,0 +1,32 @@
++#ifndef COCKPIT_SWITCH_H
++#define COCKPIT_SWITCH_H
++
++#include <stdbool.h>
++
++/* SRXL2 equivalent of RC-Cockpit's pwm_input.cpp. The original read
++ * a 3-position switch as a raw PWM pulse (1000/1500/2000us) on a
++ * dedicated GPIO; MSRC already decodes this same switch's value out
++ * of the SRXL2 stream as a channel (see srxl2_channels.h), so this
++ * module classifies that channel's value into the same three zones
++ * with the same hysteresis thresholds, just reading a decoded
++ * channel instead of measuring a pulse. Which channel is read is
++ * set once in cockpit_channels.h. */
++
++typedef enum {
++    COCKPIT_SWITCH_LOW,
++    COCKPIT_SWITCH_CENTER,
++    COCKPIT_SWITCH_HIGH,
++} cockpit_switch_zone_t;
++
++/* Call once per cockpit_task loop iteration. */
++void cockpitSwitchUpdate(void);
++
++cockpit_switch_zone_t cockpitSwitchGetZone(void);
++
++/* false when the switch channel hasn't shown up in a recent SRXL2
++ * frame (receiver unbound, transmitter off, link lost) - mirrors
++ * pwm_input's signal-timeout fallback, which the caller should treat
++ * the same way: fail safe (displays + head movement both on). */
++bool cockpitSwitchSignalPresent(void);
++
++#endif /* COCKPIT_SWITCH_H */
+diff --git a/board/project/cockpit/cockpit_task.c b/board/project/cockpit/cockpit_task.c
+index 9126571..5006a1a 100644
+--- a/board/project/cockpit/cockpit_task.c
++++ b/board/project/cockpit/cockpit_task.c
+@@ -1,44 +1,127 @@
+ #include "cockpit_task.h"
+ 
+ #include "bootscreen.h"
++#include "cockpit_channels.h"
++#include "cockpit_switch.h"
+ #include "common.h"
++#include "compat.h"
+ #include "display.h"
+ #include "imu.h"
+ #include "map.h"
+ #include "pfd.h"
++#include "pico/time.h"
+ #include "piloten.h"
++#include "srxl2_channels.h"
+ 
+-/* Owns both panels end to end: brings up the SPI driver and
+- * framebuffers, shows the boot splash once, then renders the PFD
+- * (CS1) and the moving map (CS2) in a loop, while also driving the
+- * pilot head's gaze servo from real IMU attitude data.
++/* Owns both panels end to end, plus the pilot head's gaze servo and
++ * the 3-position switch that used to come in over a dedicated PWM
++ * wire (pwm_input.cpp in the original Arduino sketch) and now comes
++ * from an SRXL2 channel instead (cockpit_switch.c), decoded by MSRC
++ * itself. Toggle behavior (not level-based - only the act of
++ * switching zones triggers anything) ported 1:1 from the original:
++ *   - switch to HIGH zone: toggle the pilot head's movement on/off
++ *   - switch to LOW zone:  toggle both displays (backlight) on/off
++ *   - CENTER itself does nothing, it's just a pass-through position
++ * Displays and head movement both start OFF at boot - nothing lights
++ * up or moves until the switch is actually worked once - and the
++ * Garmin bootscreen is shown exactly once, the first time the
++ * displays get turned on, never again after that. If the SRXL2 link
++ * drops (no recent frames, or this channel never seen), that's
++ * treated as a safety fallback: displays and head movement both
++ * forced on, same as pwm_input's old "no PWM signal" fallback.
+  *
+- * Pitch/roll/heading now come from the ICM-20948 IMU (see imu.c) -
+- * no more synthetic sweep. If the sensor isn't found at startup
+- * (not wired up yet, or a bad connection), imuBegin() logs it and
+- * the loop keeps running with pitch/roll/heading simply at 0 rather
+- * than crashing, so the rest of the panel - map, airspeed/altitude/
+- * VSI, pilot head - still comes up. Airspeed/altitude/VSI still
+- * reuse the same fixed demo values the original Arduino sketch
+- * used (no ESC/airspeed sensor port yet), and ownLat/ownLon (in
+- * map.c) never change yet either, so the map's breadcrumb track
+- * stays put - also matching the original demo. */
++ * Pitch/roll/heading come from the ICM-20948 IMU (see imu.c). If the
++ * sensor isn't found at startup, imuBegin() logs it and the loop
++ * keeps running with pitch/roll/heading at 0 rather than crashing.
++ * The pilot head additionally gets a rudder-channel bias (see
++ * piloten.h's pilotenSetRudder()) on top of the existing roll bias.
++ * Airspeed/altitude/VSI still reuse the same fixed demo values the
++ * original Arduino sketch used (no ESC/airspeed sensor port yet),
++ * and ownLat/ownLon (in map.c) never change yet either, so the map's
++ * breadcrumb track stays put - also matching the original demo. */
++
++static float cockpitReadRudderNorm(void) {
++    srxl2_channels_t ch;
++    srxl2_channels_get(&ch);
++
++    if (!(ch.mask & (1u << (COCKPIT_CH_RUDDER - 1)))) return 0.0f;
++
++    float us = srxl2_channel_to_us(ch.raw[COCKPIT_CH_RUDDER - 1]);
++    float norm = (us - 1500.0f) / 500.0f; /* ~988..2012us -> roughly -1..+1 */
++    return constrain(norm, -1.0f, 1.0f);
++}
+ 
+ void cockpit_task(void *parameters) {
+     (void)parameters;
+ 
+     cockpitDisplayBegin();
++    cockpitDisplaySetBacklight(false); /* dark until the switch turns it on */
++
+     pilotenBegin(COCKPIT_PIN_PILOT_SERVO);
++    pilotenSetEnabled(false); /* head movement also off at boot */
+ 
+     if (!imuBegin(COCKPIT_PIN_IMU_SDA, COCKPIT_PIN_IMU_SCL)) {
+         debug("\ncockpit_task: IMU nicht gefunden - Pitch/Roll/Heading bleiben auf 0");
+     }
+ 
+-    showGarminBootscreen();
+-    cockpitDisplayPushBootscreen();
+-    vTaskDelay(pdMS_TO_TICKS(4000));
++    bool displayEnabled = false;
++    bool backlightIsOn = false;
++    bool bootscreenShown = false;
++    bool showingBootscreen = false;
++    uint32_t bootscreenUntilMs = 0;
++
++    /* Prime the zone memory with the switch's actual boot position so
++     * that position itself never counts as a toggle - only a later,
++     * real switch movement does. */
++    cockpitSwitchUpdate();
++    cockpit_switch_zone_t lastZone = cockpitSwitchGetZone();
+ 
+     while (1) {
++        bool displayEnabledBefore = displayEnabled;
++
++        /* ===== SWITCH (TOGGLE, not level-based) ===== */
++        cockpitSwitchUpdate();
++        cockpit_switch_zone_t zone = cockpitSwitchGetZone();
++
++        if (!cockpitSwitchSignalPresent()) {
++            displayEnabled = true;
++            pilotenSetEnabled(true);
++            lastZone = COCKPIT_SWITCH_CENTER;
++        } else if (zone != lastZone) {
++            if (zone == COCKPIT_SWITCH_HIGH) {
++                pilotenSetEnabled(!pilotenGetEnabled());
++            } else if (zone == COCKPIT_SWITCH_LOW) {
++                displayEnabled = !displayEnabled;
++            }
++            lastZone = zone;
++        }
++
++        /* ===== FIRST TIME THE DISPLAYS COME ON -> BOOTSCREEN ONCE ===== */
++        if (displayEnabled && !displayEnabledBefore && !bootscreenShown) {
++            showGarminBootscreen();
++            cockpitDisplayPushBootscreen();
++            cockpitDisplaySetBacklight(true);
++            backlightIsOn = true;
++            bootscreenShown = true;
++            showingBootscreen = true;
++            bootscreenUntilMs = to_ms_since_boot(get_absolute_time()) + 4000;
++        }
++
++        if (showingBootscreen && !displayEnabled) {
++            showingBootscreen = false;
++        }
++
++        /* Backlight follows displayEnabled (only touch the GPIOs on
++         * an actual change). */
++        if (displayEnabled && !backlightIsOn) {
++            cockpitDisplaySetBacklight(true);
++            backlightIsOn = true;
++        } else if (!displayEnabled && backlightIsOn) {
++            cockpitDisplaySetBacklight(false);
++            backlightIsOn = false;
++        }
++
++        /* ===== IMU / PILOT HEAD (always updated, even displays off) ===== */
+         imuUpdate();
+ 
+         float pitch = imuGetPitch();
+@@ -46,11 +129,26 @@ void cockpit_task(void *parameters) {
+         int ihdg = imuGetHeading();
+ 
+         pilotenSetRoll(roll);
++        pilotenSetRudder(cockpitReadRudderNorm());
+         pilotenUpdate(); /* 1. update, before rendering - matches the
+                            * original Arduino loop's "update once, then
+                            * once more after each panel push" pattern,
+                            * trimmed from 4 panels to this board's 2. */
+ 
++        if (!displayEnabled) {
++            vTaskDelay(pdMS_TO_TICKS(20));
++            continue;
++        }
++
++        if (showingBootscreen) {
++            if (to_ms_since_boot(get_absolute_time()) >= bootscreenUntilMs) {
++                showingBootscreen = false;
++            } else {
++                vTaskDelay(pdMS_TO_TICKS(20));
++                continue;
++            }
++        }
++
+         int bug = (ihdg + 45) % 360;
+         int course = (ihdg + 30) % 360;
+         int bearing = (ihdg + 90) % 360;
+diff --git a/board/project/cockpit/piloten.c b/board/project/cockpit/piloten.c
+index 67ea390..e51eb8a 100644
+--- a/board/project/cockpit/piloten.c
++++ b/board/project/cockpit/piloten.c
+@@ -93,6 +93,22 @@ static float pilotRollDeg = 0.0f;
+ /* Wird aus dem Cockpit-Task gesetzt */
+ void pilotenSetRoll(float rollDeg) { pilotRollDeg = constrain(rollDeg, -45.0f, 45.0f); }
+ 
++/* ==========================================================
++ * RUDDER-INPUT (vom SRXL2-Kanal, ueber den Cockpit-Task)
++ * ========================================================== */
++static float pilotRudderNorm = 0.0f;
++
++void pilotenSetRudder(float rudderNorm) { pilotRudderNorm = constrain(rudderNorm, -1.0f, 1.0f); }
++
++/* ==========================================================
++ * ENABLE / DISABLE
++ * ========================================================== */
++static bool headEnabled = true;
++static bool parking = false; /* unterwegs zur reinen Neutralstellung (siehe pilotenUpdate) */
++
++void pilotenSetEnabled(bool enabled) { headEnabled = enabled; }
++bool pilotenGetEnabled(void) { return headEnabled; }
++
+ /* ==========================================================
+  * ZUFALLSZAHLEN (ersetzt Arduinos random())
+  * ========================================================== */
+@@ -122,6 +138,16 @@ static int rollBias(void) {
+     return (int)(pilotRollDeg / 45.0f * MAX_BIAS);
+ }
+ 
++/* Ruder/Gier -> Blick-Bias (zusaetzlich zur Roll-Bias). Vorzeichen
++ * ist eine Annahme (rechtes Ruder -> Blick nach rechts, wie bei der
++ * Roll-Bias) - ohne Board/Sender zum Testen nicht verifizierbar.
++ * Falls es am echten Modell seitenverkehrt ist: Vorzeichen hier
++ * einfach umdrehen. */
++static int rudderBias(void) {
++    const float MAX_BIAS = 10.0f;  // max. Servo-Grad durch Ruder
++    return (int)(pilotRudderNorm * MAX_BIAS);
++}
++
+ /* ==========================================================
+  * SERVO WRITE (RP2350 hardware_pwm)
+  * ========================================================== */
+@@ -187,7 +213,7 @@ static void updateMovement(ServoController *sc) {
+ static int neutral = 90;
+ 
+ static void updateNeutral(int *n) {
+-    int base = 90 + rollBias();
++    int base = 90 + rollBias() + rudderBias();
+     *n = constrain(base + rnd_range(-5, 6), SERVO_MIN + 10, SERVO_MAX - 10);
+ }
+ 
+@@ -245,6 +271,24 @@ void pilotenUpdate(void) {
+ 
+     updateMovement(&SC);
+ 
++    if (!headEnabled) {
++        /* Abgeschaltet: einmalig auf reine Neutralstellung (90 Grad,
++         * ohne Roll-/Ruder-Bias) fahren und dort halten. Laufende
++         * Blicksequenz/FSM wird eingefroren, nicht fortgesetzt. */
++        if (!parking) {
++            seqRunning = false;
++            moveTo(&SC, 90);
++            parking = true;
++        }
++        return;
++    }
++
++    if (parking) {
++        /* Gerade wieder aktiviert: FSM ab jetzt frisch starten. */
++        parking = false;
++        nextAction = now + rnd_range(PAUSE_MIN, PAUSE_MAX);
++    }
++
+     if (!seqRunning && now >= nextAction) {
+         nextAction = now + rnd_range(PAUSE_MIN, PAUSE_MAX);
+ 
+diff --git a/board/project/cockpit/piloten.h b/board/project/cockpit/piloten.h
+index bd097d2..f1be13a 100644
+--- a/board/project/cockpit/piloten.h
++++ b/board/project/cockpit/piloten.h
+@@ -4,7 +4,8 @@
+ /* Ported from RC-Cockpit's piloten.cpp/.h (Arduino sketch): drives
+  * the pilot head's gaze servo with realistic, non-blocking
+  * random look-around movements plus a roll-dependent bias (the
+- * pilot looks into the turn).
++ * pilot looks into the turn) and a rudder-dependent bias (the
++ * pilot also looks toward the rudder/yaw input).
+  *
+  * The reference build this was first validated on (a 4-display
+  * Waveshare board) had two pilot servos; the Core2350B's 2-display
+@@ -12,6 +13,7 @@
+  * keeps a single servo controller rather than porting the second,
+  * unused one. */
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
+ #define COCKPIT_PIN_PILOT_SERVO 21
+@@ -23,4 +25,16 @@ void pilotenUpdate(void);
+  * bias; call before pilotenUpdate() each frame. */
+ void pilotenSetRoll(float rollDeg);
+ 
++/* Rudder/yaw input, normalized -1.0 (full left) .. +1.0 (full
++ * right). Feeds a second, independent look-bias on top of the roll
++ * bias; call before pilotenUpdate() each frame. */
++void pilotenSetRudder(float rudderNorm);
++
++/* Head movement on/off. When disabled the servo moves once to pure
++ * neutral (90 degrees, no roll/rudder bias) and holds there instead
++ * of continuing the random gaze FSM; re-enabling resumes the FSM
++ * from wherever the servo currently is. */
++void pilotenSetEnabled(bool enabled);
++bool pilotenGetEnabled(void);
++
+ #endif /* COCKPIT_PILOTEN_H */
+-- 
+2.43.0
+

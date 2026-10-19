@@ -1,0 +1,135 @@
+From e6b0d47cfd889003f326f9ff44b1b978bbfeb122 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 09:44:02 +0200
+Subject: [PATCH] Add RP2350 (Cortex-M33) build target via
+ raspberrypi/FreeRTOS-Kernel RP2350_ARM_NTZ port
+
+- Point the FreeRTOS-Kernel submodule at the raspberrypi fork, which
+  ships a ready-made RP2350_ARM_NTZ port alongside the existing
+  RP2040/ARM_CM0 one. RP2040 build is unaffected.
+- board/freertos/CMakeLists.txt: select the FreeRTOS port based on
+  PICO_PLATFORM (rp2040 vs rp2350).
+- board/freertos/FreeRTOSConfig.h: scope the ISR-redirect defines to
+  RP2040, add the Armv8-M options required by the RP2350_ARM_NTZ port.
+
+Build the RP2350 target with:
+  cmake -B build -S board -DPICO_BOARD=waveshare_core2350b -DCMAKE_BUILD_TYPE=Release
+  cmake --build build
+
+Untested (no ARM toolchain build performed) - please verify and report
+back any build errors.
+---
+ .gitmodules                     |  5 ++++-
+ board/freertos/CMakeLists.txt   | 40 ++++++++++++++++++++++++++++-----
+ board/freertos/FreeRTOS-Kernel  |  2 +-
+ board/freertos/FreeRTOSConfig.h | 17 +++++++++++++-
+ 4 files changed, 55 insertions(+), 9 deletions(-)
+
+diff --git a/.gitmodules b/.gitmodules
+index 6fa3402..e1767d6 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -1,3 +1,6 @@
+ [submodule "board/freertos/FreeRTOS-Kernel"]
+ 	path = board/freertos/FreeRTOS-Kernel
+-	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
++	# RP2350-Support (RP2350_ARM_NTZ-Port) gibt es nur im RPi-eigenen Fork,
++	# nicht im FreeRTOS-Upstream. Der RP2040/ARM_CM0-Port ist darin
++	# weiterhin enthalten, der bestehende RP2040-Build bleibt unverändert.
++	url = https://github.com/raspberrypi/FreeRTOS-Kernel.git
+diff --git a/board/freertos/CMakeLists.txt b/board/freertos/CMakeLists.txt
+index faca68e..775757f 100644
+--- a/board/freertos/CMakeLists.txt
++++ b/board/freertos/CMakeLists.txt
+@@ -8,11 +8,39 @@ add_library(freertos
+     ${PICO_SDK_FREERTOS_SOURCE}/tasks.c
+     ${PICO_SDK_FREERTOS_SOURCE}/timers.c
+     ${PICO_SDK_FREERTOS_SOURCE}/portable/MemMang/heap_3.c
+-    ${PICO_SDK_FREERTOS_SOURCE}/portable/GCC/ARM_CM0/port.c
+ )
+ 
+-target_include_directories(freertos PUBLIC
+-    .
+-    ${PICO_SDK_FREERTOS_SOURCE}/include
+-    ${PICO_SDK_FREERTOS_SOURCE}/portable/GCC/ARM_CM0
+-)
++if (PICO_PLATFORM STREQUAL "rp2040")
++    target_sources(freertos PRIVATE
++        ${PICO_SDK_FREERTOS_SOURCE}/portable/GCC/ARM_CM0/port.c
++    )
++    target_include_directories(freertos PUBLIC
++        .
++        ${PICO_SDK_FREERTOS_SOURCE}/include
++        ${PICO_SDK_FREERTOS_SOURCE}/portable/GCC/ARM_CM0
++    )
++else()
++    # RP2350, Arm-Kern (Cortex-M33, non-secure). Der RISC-V-Kern des
++    # RP2350 wird hier nicht unterstuetzt.
++    set(FREERTOS_RP2350_PORT_DIR
++        ${PICO_SDK_FREERTOS_SOURCE}/portable/ThirdParty/GCC/RP2350_ARM_NTZ/non_secure)
++    target_sources(freertos PRIVATE
++        ${FREERTOS_RP2350_PORT_DIR}/port.c
++        ${FREERTOS_RP2350_PORT_DIR}/portasm.c
++    )
++    target_include_directories(freertos PUBLIC
++        .
++        ${PICO_SDK_FREERTOS_SOURCE}/include
++        ${FREERTOS_RP2350_PORT_DIR}
++    )
++    target_compile_definitions(freertos PUBLIC
++        LIB_FREERTOS_KERNEL=1
++        FREE_RTOS_KERNEL_SMP=1
++        PICO_CONFIG_RTOS_ADAPTER_HEADER=${CMAKE_CURRENT_LIST_DIR}/${FREERTOS_RP2350_PORT_DIR}/freertos_sdk_config.h
++    )
++    target_link_libraries(freertos PUBLIC
++        hardware_clocks
++        hardware_exception
++        pico_multicore
++    )
++endif()
+diff --git a/board/freertos/FreeRTOS-Kernel b/board/freertos/FreeRTOS-Kernel
+index b213ad8..4f7299d 160000
+--- a/board/freertos/FreeRTOS-Kernel
++++ b/board/freertos/FreeRTOS-Kernel
+@@ -1 +1 @@
+-Subproject commit b213ad8b6e51f66f7da440c4902acf8b0412d946
++Subproject commit 4f7299d6ea746b27a9dd19e87af568e34bd65b15
+diff --git a/board/freertos/FreeRTOSConfig.h b/board/freertos/FreeRTOSConfig.h
+index b490669..54bc24e 100644
+--- a/board/freertos/FreeRTOSConfig.h
++++ b/board/freertos/FreeRTOSConfig.h
+@@ -1,10 +1,15 @@
+ #ifndef FREERTOS_CONFIG_H
+ #define FREERTOS_CONFIG_H
+ 
+-/* Use Pico SDK ISR handlers */
++/* Use Pico SDK ISR handlers (nur RP2040/Cortex-M0: der RP2350-Port
++   (Cortex-M33) definiert SVC_Handler/PendSV_Handler/SysTick_Handler
++   bereits direkt - das deckt sich schon mit dem, was die SDK-eigene
++   CMSIS-Umbenennung fuer M33 erwartet, keine Umleitung noetig) */
++#if PICO_RP2040
+ #define vPortSVCHandler         isr_svcall
+ #define xPortPendSVHandler      isr_pendsv
+ #define xPortSysTickHandler     isr_systick
++#endif
+ 
+ #define configUSE_PREEMPTION                    1
+ #define configUSE_PORT_OPTIMISED_TASK_SELECTION 0
+@@ -81,4 +86,14 @@
+ 
+ /* A header file that defines trace macro can be included here. */
+ 
++/* Pflichtoptionen fuer den Armv8-M-Port (RP2350, Cortex-M33), siehe
++   portable/ThirdParty/GCC/RP2350_ARM_NTZ/README.md im FreeRTOS-Kernel */
++#if PICO_RP2350 && !PICO_RISCV
++#define configENABLE_MPU                        0
++#define configENABLE_TRUSTZONE                  0
++#define configRUN_FREERTOS_SECURE_ONLY          1
++#define configENABLE_FPU                        1
++#define configMAX_SYSCALL_INTERRUPT_PRIORITY    16
++#endif
++
+ #endif /* FREERTOS_CONFIG_H */
+-- 
+2.43.0
+

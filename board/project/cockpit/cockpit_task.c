@@ -2,6 +2,7 @@
 
 #include "bootscreen.h"
 #include "cockpit_channels.h"
+#include "cockpit_pins.h"
 #include "cockpit_switch.h"
 #include "common.h"
 #include "compat.h"
@@ -104,7 +105,7 @@ void cockpit_task(void *parameters) {
             backlightIsOn = true;
             bootscreenShown = true;
             showingBootscreen = true;
-            bootscreenUntilMs = to_ms_since_boot(get_absolute_time()) + 4000;
+            bootscreenUntilMs = to_ms_since_boot(get_absolute_time()) + COCKPIT_BOOTSCREEN_MS;
         }
 
         if (showingBootscreen && !displayEnabled) {
