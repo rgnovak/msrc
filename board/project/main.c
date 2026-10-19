@@ -1,6 +1,8 @@
 #include <stdio.h>
 
+#if MSRC_ENABLE_COCKPIT
 #include "cockpit_task.h"
+#endif
 #include "config.h"
 #include "crsf.h"
 #include "dbg_task.h"
@@ -103,9 +105,11 @@ int main() {
         case RX_SRXL2:
             xTaskCreate(srxl2_task, "srxl2_task", STACK_RX_SRXL2, NULL, 3, &context.receiver_task_handle);
             context.uart0_notify_task_handle = context.receiver_task_handle;
+#if MSRC_ENABLE_COCKPIT
             // Cockpit display panels (PFD + moving map). Lower priority than the
             // receiver task so rendering never delays SRXL2 frame handling.
             xTaskCreate(cockpit_task, "cockpit_task", STACK_COCKPIT, NULL, 1, NULL);
+#endif
             break;
         case SERIAL_MONITOR:
             xTaskCreate(serial_monitor_task, "serial_monitor", STACK_SERIAL_MONITOR, NULL, 3,
